@@ -1,5 +1,15 @@
 # @zakkster/lite-hud
 
+[![npm version](https://img.shields.io/npm/v/@zakkster/lite-hud.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-hud)
+![Zero-GC](https://img.shields.io/badge/Zero--GC-Hot%20path-00C853?style=for-the-badge&logo=leaf&logoColor=white)
+[![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
+[![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-hud?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-hud)
+[![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-hud?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-hud)
+[![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-hud?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-hud)
+![TypeScript](https://img.shields.io/badge/TypeScript-Types-informational)
+![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+
 > Single-canvas zero-GC perf overlay. stats.js replacement that allocates nothing per frame.
 
 Preallocated ring-buffer tracks, composable sink API for any profiler, oscilloscope phosphor-green aesthetic, hotkey toggle. Ship it inside a Twitch overlay behind a hotkey without worrying about GC pauses.
