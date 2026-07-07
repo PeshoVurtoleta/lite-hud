@@ -1,0 +1,45 @@
+# @zakkster/lite-hud
+
+Single-canvas zero-GC perf overlay for browser applications.
+
+## What it does
+
+Renders a fixed-position canvas overlay with ring-buffer-backed tracks.
+Any profiler pushes values via track.push(value); the HUD renders bars,
+stats, and threshold coloring. stats.js replacement that allocates nothing
+per frame.
+
+## API
+
+createHud(canvas?, options?) -- create HUD, auto-creates canvas if null.
+  options: width, height, position, hotkey, zIndex, visible.
+
+hud.track(name, options?) -- register a track, returns TrackHandle.
+  options: label, unit, lo, hi, warnBelow, color, samples.
+
+track.push(value) -- ZERO-GC HOT PATH. One typed-array write per call.
+track.peek() -- last value.
+
+hud.render() -- draw all tracks (cold path, call at 10-15Hz).
+hud.resize() -- recompute canvas dims for current DPR (auto on DPR change).
+hud.destroy() -- cleanup.
+hud.visible -- get/set visibility.
+
+## Sink pattern
+
+Any profiler calls track.push(v) once per frame:
+  fpsTrack.push(fps);
+  frameTrack.push(dt);
+  gcTrack.push(bytesPerCall);
+  nodesTrack.push(activeNodes);
+
+The HUD renders them all on one canvas with independent ring buffers.
+
+## Threshold coloring
+
+hi set + warnBelow false: green below hi, amber above (frame time, draws).
+lo set + warnBelow true: green above lo, amber below (FPS, throughput).
+
+## Zero dependencies
+
+Single-file ESM. Canvas 2D only. No DOM manipulation on the hot path.

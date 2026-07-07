@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lite-hud 1.0.0 -- zero-GC perf overlay</title>
+<style>
+  :root {
+    --bg:        #05100a;
+    --bg:        oklch(0.16 0.03 165);
+    --panel:     #0a1a10;
+    --panel:     oklch(0.21 0.035 165);
+    --grid:      #1f6f4529;
+    --grid:      oklch(0.55 0.11 165 / 0.16);
+    --ink:       #7df7c8;
+    --ink:       oklch(0.90 0.15 168);
+    --ink-dim:   #3f9c78;
+    --ink-dim:   oklch(0.68 0.09 168);
+    --ink-faint: #2a6f56;
+    --ink-faint: oklch(0.52 0.06 168);
+    --edge:      #2f5a4e80;
+    --edge:      oklch(0.42 0.06 168 / 0.5);
+    --r:         0.5rem;
+    --mono:      ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      linear-gradient(transparent 0 calc(1.5rem - 1px), var(--grid) calc(1.5rem - 1px) 1.5rem),
+      linear-gradient(90deg, transparent 0 calc(1.5rem - 1px), var(--grid) calc(1.5rem - 1px) 1.5rem),
+      var(--bg);
+    background-size: 1.5rem 1.5rem;
+    color: var(--ink); font-family: var(--mono); font-size: 0.9rem; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 1.5rem;
+  }
+  .info {
+    text-align: center; max-width: 38rem;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 0.5rem; letter-spacing: 0.02em; }
+  h1 .v { color: var(--ink-faint); font-weight: 400; }
+  p { color: var(--ink-dim); font-size: 0.82rem; margin: 0 0 0.8rem; }
+  .controls { display: flex; gap: 0.8rem; justify-content: center; flex-wrap: wrap; margin-bottom: 1rem; }
+  button {
+    font: inherit; color: var(--bg); background: var(--ink); border: 1px solid var(--ink);
+    border-radius: var(--r); padding: 0.35rem 0.7rem; cursor: pointer; font-size: 0.78rem;
+  }
+  @media (hover: hover) { button:hover { background: var(--ink-dim); border-color: var(--ink-dim); } }
+  .btn-sec { background: transparent; color: var(--ink-dim); border-color: var(--edge); }
+  @media (hover: hover) { .btn-sec:hover { color: var(--ink); border-color: var(--ink-faint); background: transparent; } }
+  label { color: var(--ink-dim); font-size: 0.78rem; display: flex; align-items: center; gap: 0.4rem; }
+  input[type=range] { accent-color: var(--ink); width: 5rem; }
+  code { color: var(--ink); background: color-mix(in oklab, var(--ink) 10%, transparent); padding: 0 0.25rem; border-radius: 3px; }
+  .scene {
+    width: 100%; max-width: 50rem; height: 16rem;
+    border: 1px solid var(--edge); border-radius: var(--r);
+    background: var(--panel); position: relative; overflow: hidden;
+  }
+  .scene canvas { width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<div class="info">
+  <h1>lite-hud <span class="v">1.0.0 -- zero-GC perf overlay</span></h1>
+  <p>
+    A simulated game loop pushes frame time, FPS, draw calls, and signal-node
+    count into the HUD every frame. The overlay renders at ~15Hz from
+    preallocated ring buffers. Press <code>`</code> to toggle. Zero allocation
+    on the hot path (<code>track.push(value)</code> is one typed-array write).
+  </p>
+  <div class="controls">
+    <label>load
+      <input type="range" id="load" min="1" max="20" value="8" step="1">
+      <span id="loadVal">8</span> ms
+    </label>
+    <button id="spike" class="btn-sec">Inject spike</button>
+    <button id="toggleBtn">Toggle HUD</button>
+  </div>
+</div>
+<div class="scene">
+  <canvas id="scene"></canvas>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-hud": "../Hud.js"
+  }
+}
+</script>
+<script type="module">
+import { createHud } from '@zakkster/lite-hud';
+
+// ---- cached refs ----
+const $scene = document.getElementById('scene');
+const $load = document.getElementById('load');
+const $loadVal = document.getElementById('loadVal');
+const $spike = document.getElementById('spike');
+const $toggleBtn = document.getElementById('toggleBtn');
+
+// ---- HUD setup: 4 tracks, auto-created canvas overlay ----
+const hud = createHud(null, {
+    width: 240,
+    position: 'top-right',
+    hotkey: '`'
+});
+
+const fpsTrack = hud.track('fps', {
+    unit: 'fps', lo: 30, warnBelow: true, samples: 128
+});
+const frameTrack = hud.track('frame', {
+    unit: 'ms', hi: 16.67, samples: 128
+});
+const drawTrack = hud.track('draws', {
+    unit: '', hi: 200, samples: 128,
+    color: '#4ecdc4'
+});
+const nodesTrack = hud.track('nodes', {
+    unit: '', samples: 128,
+    color: '#bb86fc'
+});
+
+// ---- simulated scene rendering ----
+const sctx = $scene.getContext('2d');
+const DPR = Math.min(2, window.devicePixelRatio || 1);
+function sceneResize() {
+    const r = $scene.getBoundingClientRect();
+    $scene.width = Math.round(r.width * DPR);
+    $scene.height = Math.round(r.height * DPR);
+}
+sceneResize();
+window.addEventListener('resize', sceneResize);
+
+// particle system -- the "game" being profiled
+const NUM_PARTICLES = 300;
+const px = new Float64Array(NUM_PARTICLES);
+const py = new Float64Array(NUM_PARTICLES);
+const pvx = new Float64Array(NUM_PARTICLES);
+const pvy = new Float64Array(NUM_PARTICLES);
+const TAU = Math.PI * 2;
+
+for (let i = 0; i < NUM_PARTICLES; i++) {
+    px[i] = Math.random(); py[i] = Math.random();
+    const a = Math.random() * TAU;
+    const s = 0.1 + Math.random() * 0.3;
+    pvx[i] = Math.cos(a) * s; pvy[i] = Math.sin(a) * s;
+}
+
+function updateParticles(dt) {
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+        px[i] += pvx[i] * dt;
+        py[i] += pvy[i] * dt;
+        if (px[i] < 0 || px[i] > 1) pvx[i] = -pvx[i];
+        if (py[i] < 0 || py[i] > 1) pvy[i] = -pvy[i];
+    }
+}
+
+function drawScene() {
+    const w = $scene.width, h = $scene.height;
+    sctx.clearRect(0, 0, w, h);
+    sctx.fillStyle = 'oklch(0.90 0.15 168 / 0.6)';
+    const r = 2.5 * DPR;
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+        sctx.fillRect(px[i] * w - r, py[i] * h - r, r * 2, r * 2);
+    }
+}
+
+// ---- artificial load ----
+let targetLoadMs = 8;
+let spikeFrames = 0;
+
+function burn(ms) {
+    const end = performance.now() + ms;
+    let x = 0;
+    while (performance.now() < end) { x += Math.sqrt(x + 1) * 1.0001; }
+    return x;
+}
+
+$load.addEventListener('input', () => {
+    targetLoadMs = +$load.value;
+    $loadVal.textContent = targetLoadMs;
+});
+$spike.addEventListener('click', () => { spikeFrames = 30; });
+$toggleBtn.addEventListener('click', () => { hud.visible = !hud.visible; });
+
+// ---- main loop ----
+let lastTime = performance.now();
+let fps = 60;
+let fpsAccum = 0;
+let fpsFrameCount = 0;
+let drawAccum = 0;
+let simDrawCalls = 80;
+let simNodes = 512;
+
+function loop(now) {
+    const dt = now - lastTime;
+    lastTime = now;
+
+    // Simulate workload
+    const loadMs = spikeFrames > 0
+        ? targetLoadMs * 3 + Math.random() * 10
+        : targetLoadMs * (0.85 + Math.random() * 0.3);
+    if (spikeFrames > 0) spikeFrames--;
+    burn(loadMs);
+
+    // Update particles
+    updateParticles(dt / 1000);
+    drawScene();
+
+    // Simulate varying draw calls and node count
+    simDrawCalls = 60 + Math.floor(Math.random() * 80) + (spikeFrames > 0 ? 150 : 0);
+    simNodes = 480 + Math.floor(Math.random() * 64) + (spikeFrames > 0 ? 200 : 0);
+
+    // FPS computation
+    fpsAccum += dt;
+    fpsFrameCount++;
+    if (fpsAccum >= 500) {
+        fps = Math.round(fpsFrameCount * 1000 / fpsAccum);
+        fpsAccum = 0; fpsFrameCount = 0;
+    }
+
+    // ---- HOT PATH: push values into the HUD ----
+    // Each push is a single typed-array write. Zero allocation.
+    fpsTrack.push(fps);
+    frameTrack.push(dt);
+    drawTrack.push(simDrawCalls);
+    nodesTrack.push(simNodes);
+
+    // Render HUD at ~15Hz (the render path is cold)
+    drawAccum += dt;
+    if (drawAccum >= 66) {
+        drawAccum = 0;
+        hud.render();
+    }
+
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
