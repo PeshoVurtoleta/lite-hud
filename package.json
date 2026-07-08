@@ -1,10 +1,8 @@
 {
   "name": "@zakkster/lite-hud",
-  "version": "1.0.0",
-  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "description": "Single-canvas zero-GC perf overlay. Preallocated ring-buffer tracks, composable sink API for any profiler, hotkey toggle. stats.js replacement that allocates nothing per frame.",
+  "version": "2.0.0",
+  "description": "SPP-native zero-GC canvas overlay for the @zakkster profiler suite.",
   "type": "module",
-  "sideEffects": false,
   "main": "./Hud.js",
   "module": "./Hud.js",
   "types": "./Hud.d.ts",
@@ -19,30 +17,25 @@
   "files": [
     "Hud.js",
     "Hud.d.ts",
-    "README.md",
     "CHANGELOG.md",
     "llms.txt",
+    "README.md",
     "LICENSE"
   ],
+  "sideEffects": false,
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/Hud.test.js"
   },
   "keywords": [
     "hud",
     "overlay",
-    "perf",
-    "performance",
-    "stats",
-    "fps",
-    "zero-gc",
-    "profiler",
     "canvas",
-    "ring-buffer",
+    "profiler",
+    "spp",
+    "zero-gc",
     "lite"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "license": "MIT",
   "homepage": "https://github.com/PeshoVurtoleta/lite-hud#readme",
   "repository": {
@@ -50,14 +43,10 @@
     "url": "git+https://github.com/PeshoVurtoleta/lite-hud.git"
   },
   "bugs": {
-    "url": "https://github.com/PeshoVurtoleta/lite-hud/issues",
-    "email": "shinikchiev@yahoo.com"
+    "url": "https://github.com/PeshoVurtoleta/lite-hud/issues"
   },
   "funding": {
     "type": "github",
     "url": "https://github.com/sponsors/PeshoVurtoleta"
-  },
-  "engines": {
-    "node": ">=18"
   }
 }

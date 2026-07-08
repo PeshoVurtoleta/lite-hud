@@ -1,82 +1,153 @@
+// @zakkster/lite-hud 2.0.0
+// Copyright (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com>
+// MIT License
+
 export declare const VERSION: string;
 
-export interface TrackOptions {
-    /** Display label. Defaults to the track name. */
-    label?: string;
-    /** Unit suffix shown after the current value (e.g. 'ms', 'fps'). */
-    unit?: string;
-    /** Low threshold. Used with warnBelow for FPS-style metrics. */
-    lo?: number;
-    /** High threshold. Values above this are rendered in warn color. */
-    hi?: number;
-    /** If true, warn when value drops BELOW lo (e.g. FPS). Default: warn above hi. */
-    warnBelow?: boolean;
-    /** Override color (hex or oklch string). */
-    color?: string;
-    /** Ring buffer size (rounded up to power of two). Default 128. */
-    samples?: number;
+// ---------------------------------------------------------------------------
+// SPP protocol surface (duck-typed, no runtime import of lite-scope)
+// ---------------------------------------------------------------------------
+
+export interface SppSink {
+  write(packed: number, t: number, a: number, b: number): void;
 }
 
-export interface TrackHandle {
-    /**
-     * Push a new sample value. This is the HOT PATH -- a single
-     * typed-array write plus a bitmask index. Zero allocation.
-     */
-    push(value: number): void;
-    /** Return the most recently pushed value. */
-    peek(): number;
-    /** Track name. */
-    readonly name: string;
-    /** Number of samples in the ring buffer (caps at capacity). */
-    readonly count: number;
+export interface StreamOpDescriptor {
+  code: number;
+  name?: string;
+  /** 0 = LEVEL | 1 = INSTANT | 2 = SPAN | 3 = COUNTER */
+  kind?: 0 | 1 | 2 | 3;
+  /** CONT chain depth + 1. Defaults to 1. */
+  width?: number;
+  /** True for open and close ops of a paired span channel. */
+  paired?: boolean;
 }
+
+export interface StreamDescriptor {
+  /** Dense id assigned by scope.register(). */
+  id: number;
+  name?: string;
+  unit?: string;
+  hz?: number;
+  ops: StreamOpDescriptor[];
+}
+
+export interface HudScope {
+  streams(): StreamDescriptor[];
+  /** Reverse intern lookup: internId -> channel name string. */
+  label(internId: number): string | null;
+  /**
+   * Registers the HUD as a live sink. Optional -- if omitted, the HUD is
+   * still populated by direct hud.write() calls.
+   */
+  addSink?(sink: SppSink): void;
+  removeSink?(sink: SppSink): void;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+export interface PushHandle {
+  /**
+   * Synthesize an SPP record and inject it directly into the HUD's demux.
+   *
+   * - KIND_LEVEL / KIND_COUNTER: push(value) -> t=now, a=value
+   * - KIND_INSTANT:              push()       -> t=now, a=0
+   * - KIND_SPAN (complete):      push(durationMs) -> t=now-dur, a=dur (D5 layout)
+   */
+  push(value?: number): void;
+}
+
+export interface ChannelDescriptor {
+  name?: string;
+  unit?: string;
+  /** Declared sample rate. Controls ring capacity (hz * windowSec records). */
+  hz?: number;
+  /** 0 = LEVEL | 1 = INSTANT | 2 = SPAN (complete) | 3 = COUNTER. Defaults to 0. */
+  kind?: 0 | 1 | 2 | 3;
+}
+
+export interface BudgetDescriptor {
+  /** Matches channel by exact name string. */
+  channel: string;
+  threshold: number;
+  label?: string;
+}
+
+export interface AttachOptions {
+  /**
+   * Inline budget thresholds applied at attach time.
+   * Also transported via BUDGET_SET (0x0F41) meta records at run time.
+   */
+  budgets?: BudgetDescriptor[];
+}
+
+export interface ChannelStats {
+  name: string;
+  count: number;
+  head: number;
+}
+
+export interface HudStats {
+  drops: number;
+  channels: number;
+  epoch: number | null;
+  verdicts: number;
+  budgets: number;
+  channelStats: ChannelStats[];
+}
+
+export interface InspectResult {
+  /** Total records written (may exceed ring capacity). */
+  count: number;
+  /** Slots of the most recent ring record. */
+  last: { t: number; a: number; b: number };
+}
+
+export type HudPosition = 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left';
 
 export interface HudOptions {
-    /** Canvas width in CSS pixels. Default 280. */
-    width?: number;
-    /** Canvas height in CSS pixels. Auto-computed from track count if omitted. */
-    height?: number;
-    /** Corner position. Default 'top-left'. */
-    position?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
-    /** Keyboard key to toggle visibility. Default '`'. */
-    hotkey?: string;
-    /** CSS z-index. Default 100000. */
-    zIndex?: number;
-    /** Initial visibility. Default true. */
-    visible?: boolean;
+  position?: HudPosition;
+  /** Key that toggles overlay visibility. Default: '`'. Set '' to disable. */
+  hotkey?: string;
+  zIndex?: number;
+  /** Width of the scrolling time window in seconds. Default: 5. */
+  windowSec?: number;
 }
 
-export interface Hud {
-    /**
-     * Register a named track. Returns a handle with a zero-GC push method.
-     */
-    track(name: string, options?: TrackOptions): TrackHandle;
-    /**
-     * Render all tracks to the canvas. Call at 10-15Hz (cold path).
-     */
-    render(): void;
-    /**
-     * Recompute canvas size for the current `devicePixelRatio`. Called
-     * automatically on track registration and when the browser's DPR
-     * changes (window dragged between monitors). Call manually if you
-     * change the container or need to force a resize.
-     */
-    resize(): void;
-    /** Remove the canvas, keyboard listener, and clear tracks. */
-    destroy(): void;
-    /** Current visibility state. */
-    visible: boolean;
-    /** Number of registered tracks. */
-    readonly trackCount: number;
-    /** The canvas element (null before first render if auto-created). */
-    readonly canvas: HTMLCanvasElement | null;
+export interface Hud extends SppSink {
+  // Scope integration
+  attach(scope: HudScope, opts?: AttachOptions): void;
+
+  // Manual channel (D4 polyfill -- no scope required)
+  channel(desc: ChannelDescriptor): PushHandle;
+
+  // Inspection
+  stats(): HudStats;
+  /**
+   * Returns the most recent record for a named channel, or null if the
+   * channel does not exist or has received no data.
+   * Cold path; allocates. Not for use on frame-loop hot paths.
+   */
+  inspect(name: string): InspectResult | null;
+
+  // Rendering
+  /** Draw all visible channels onto the overlay canvas. Call at ~10-15 Hz. */
+  render(): void;
+
+  // Overlay chrome
+  show(): void;
+  hide(): void;
+  destroy(): void;
+  readonly visible: boolean;
 }
 
 /**
- * Create a performance HUD overlay.
+ * Create an SPP-native HUD overlay.
  *
- * @param canvas  Canvas to render into. If null, one is created and appended
- *                to document.body with fixed positioning.
- * @param options  HUD configuration.
+ * @param mountEl  DOM element to append the canvas to, or null (headless /
+ *                 test mode -- all DOM/canvas ops are skipped).
+ * @param opts     Optional configuration.
  */
-export function createHud(canvas: HTMLCanvasElement | null, options?: HudOptions): Hud;
+export function createHud(mountEl: HTMLElement | null, opts?: HudOptions): Hud;

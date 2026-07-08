@@ -10,140 +10,232 @@
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
-> Single-canvas zero-GC perf overlay. stats.js replacement that allocates nothing per frame.
 
-Preallocated ring-buffer tracks, composable sink API for any profiler, oscilloscope phosphor-green aesthetic, hotkey toggle. Ship it inside a Twitch overlay behind a hotkey without worrying about GC pauses.
+> SPP-native zero-GC canvas overlay for the `@zakkster` profiler suite.
 
-```bash
+Single-file ESM, no runtime dependencies, phosphor-green oscilloscope aesthetic.
+Designed as the read-side consumer of `@zakkster/lite-scope`'s mux registry.
+Also works as a drop-in `stats.js` replacement via `hud.channel()`.
+
+**v2.0.0 is a breaking rewrite.** See the [migration guide](#migration-from-v1) below.
+
+---
+
+## Install
+
+```sh
 npm install @zakkster/lite-hud
 ```
 
-## Quick start
+---
+
+## Scope-driven mode (primary)
 
 ```js
 import { createHud } from '@zakkster/lite-hud';
+import { createScope } from '@zakkster/lite-scope';
 
-const hud = createHud(null, { position: 'top-right', hotkey: '`' });
+const scope = createScope();
+const hud   = createHud(document.body, { windowSec: 5, position: 'top-right' });
 
-const fps   = hud.track('fps',   { unit: 'fps', lo: 30, warnBelow: true });
-const frame = hud.track('frame', { unit: 'ms',  hi: 16.67 });
-const draws = hud.track('draws', { hi: 200 });
+hud.attach(scope, {
+  budgets: [
+    { channel: 'frame', threshold: 16.67, label: '60fps budget' },
+  ],
+});
 
+// Rendering loop -- call at ~10-15 Hz
 function loop() {
-    // Your frame work here...
-
-    // HOT PATH: one typed-array write per push. Zero allocation.
-    fps.push(currentFps);
-    frame.push(frameDeltaMs);
-    draws.push(drawCallCount);
-
-    // COLD PATH: render at 10-15Hz.
-    hud.render();
-
-    requestAnimationFrame(loop);
+  requestAnimationFrame(loop);
+  if (frameCount++ % 4 === 0) hud.render();
 }
-requestAnimationFrame(loop);
+loop();
 ```
 
-Press `` ` `` to toggle the overlay.
+`attach()` reads `scope.streams()`, builds an O(1) LUT per stream, and registers the HUD as a live mux sink via `scope.addSink()`. From that point every SPP record emitted by any probe flows directly into the HUD with no copy.
 
-## Why this exists
+---
 
-`stats.js` allocates per frame (DOM text updates, style recalculations, layout thrash). For a Twitch Extension overlay with a 1MB bundle cap and zero-GC-within-16ms requirement, that's disqualifying. Nothing modern exists that's composable (plug in any profiler as a track) and safe to ship in production behind a hotkey.
+## Manual channel mode (drop-in stats.js replacement)
 
-## Design
-
-**Two paths, one contract.**
-
-The hot path is `track.push(value)` -- a single typed-array write with a bitmask index. No closures, no objects, no string operations. The ring buffer is preallocated at track creation (power-of-two capacity, default 128 samples). Push never allocates.
-
-The cold path is `hud.render()` -- canvas 2D drawing at 10-15Hz. This reads from the ring buffers and draws bars, threshold lines, labels, and stats. Call it on a throttle counter, not every frame.
-
-**Composable sinks.** Each `hud.track()` returns an independent handle. Any profiler pushes into its own track:
+No scope setup required.
 
 ```js
-// lite-gc-profiler
-gcTrack.push(bytesPerCall);
+const hud   = createHud(document.body);
+const fps   = hud.channel({ name: 'fps',       kind: 0 }); // LEVEL
+const gc    = hud.channel({ name: 'gc',        kind: 1 }); // INSTANT
+const frame = hud.channel({ name: 'frame',     kind: 2 }); // SPAN (complete)
+const draws = hud.channel({ name: 'draw calls', kind: 3 }); // COUNTER
 
-// lite-signal-profiler
-nodesTrack.push(registry.stats().activeNodes);
-
-// lite-gpu-profiler
-stallTrack.push(stallCount);
-
-// Your own metrics
-customTrack.push(whatever);
+// Anywhere in your code:
+fps.push(59.8);
+gc.push();
+frame.push(12.4);   // duration in ms; t_start = now - 12.4  (D5 layout)
+draws.push(312);
 ```
 
-The HUD doesn't know or care what the numbers mean. It renders bars, computes min/avg/max, and colors them by threshold.
+`push()` synthesizes a valid SPP record and calls `hud.write()` directly -- the
+same demux path used by scope probes. There is no separate ring or draw path.
 
-## API
+---
 
-### `createHud(canvas, options?)`
+## API reference
 
-Create a HUD. If `canvas` is null, one is created and appended to `document.body` with fixed positioning.
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `width` | number | 280 | Canvas width (CSS px) |
-| `height` | number | auto | Canvas height; auto-computed from track count |
-| `position` | string | `'top-left'` | Corner: `top-left`, `top-right`, `bottom-left`, `bottom-right` |
-| `hotkey` | string | `` '`' `` | Key to toggle visibility |
-| `zIndex` | number | 100000 | CSS z-index |
-| `visible` | boolean | true | Initial visibility |
-
-### `hud.track(name, options?)`
-
-Register a named track. Returns a `TrackHandle`.
+### `createHud(mountEl, opts?): Hud`
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `label` | string | name | Display label |
-| `unit` | string | `''` | Unit suffix (e.g. `'ms'`, `'fps'`) |
-| `lo` | number | null | Low threshold |
-| `hi` | number | null | High threshold (values above render amber) |
-| `warnBelow` | boolean | false | Warn when BELOW `lo` (for FPS-style metrics) |
-| `color` | string | auto | Override color (hex or oklch) |
-| `samples` | number | 128 | Ring buffer capacity (rounded to power of two) |
+| `windowSec` | `number` | `5` | Scrolling time window width in seconds |
+| `position` | `'top-right' \| 'top-left' \| 'bottom-right' \| 'bottom-left'` | `'top-right'` | Canvas corner |
+| `hotkey` | `string` | `` '`' `` | Key that toggles visibility. `''` to disable |
+| `zIndex` | `number` | `9999` | CSS z-index of the canvas |
 
-### `TrackHandle`
+Pass `null` as `mountEl` for headless / test mode. All DOM and canvas operations are skipped; the full state layer remains active.
 
-| Method | Description |
-|--------|-------------|
-| `push(value)` | Push a sample. **Zero-GC hot path.** Non-finite values (`Infinity`, `-Infinity`, `NaN`) are silently dropped. |
-| `peek()` | Last pushed value. |
-| `name` | Track name (readonly). |
-| `count` | Samples in buffer (readonly, caps at capacity). |
+---
+
+### `hud.attach(scope, opts?)`
+
+Reads `scope.streams()`, builds the LUT, and calls `scope.addSink(hud)`.
+
+`opts.budgets` is an array of inline threshold lines applied at attach time:
+
+```js
+{ channel: 'fps', threshold: 60, label: 'min fps' }
+```
+
+Budget thresholds are also transported at runtime via the `BUDGET_SET` (0x0F41) meta opcode: `a = interned_name_id`, `b = threshold_value`.
+
+---
+
+### `hud.channel(desc): { push(v?) }`
+
+Creates a manual channel. Synthetic stream IDs are assigned from `0x8000` and never conflict with scope-registered stream IDs (dense from 1).
+
+| Field | Type | Default |
+|-------|------|---------|
+| `name` | `string` | `'ch<n>'` |
+| `unit` | `string` | `''` |
+| `hz` | `number` | `null` (256-record ring) |
+| `kind` | `0\|1\|2\|3` | `0` (LEVEL) |
+
+**`push()` semantics by kind:**
+
+| Kind | Call | What is stored |
+|------|------|----------------|
+| LEVEL (0) | `push(value)` | `t=now, a=value` |
+| INSTANT (1) | `push()` | `t=now, a=0` |
+| SPAN (2) | `push(durationMs)` | `t=now-dur, a=dur` (D5) |
+| COUNTER (3) | `push(value)` | `t=now, a=value` |
+
+---
+
+### `hud.write(packed, t, a, b)`
+
+Duck-typed SPP sink entry point. Called automatically by the scope mux after `attach()`; also used directly by `push()` for manual channels.
+
+Packed field decoding uses arithmetic (not bitwise) to handle the full u16 stream ID range:
+
+```js
+const sid = (packed / 65536) | 0;
+const op  = (packed - sid * 65536) | 0;
+```
+
+---
+
+### `hud.stats()`
+
+```ts
+{
+  drops:        number;    // unrouted records (LUT miss or pool eviction)
+  channels:     number;
+  epoch:        number | null;  // t from last EPOCH (0x0F00) meta record
+  verdicts:     number;    // gate verdicts stored (capped at 64)
+  budgets:      number;    // total threshold lines across all channels
+  channelStats: Array<{ name: string; count: number; head: number }>;
+}
+```
+
+### `hud.inspect(name): { count, last: { t, a, b } } | null`
+
+Returns the most recent ring record for a named channel. Cold path -- allocates. Do not call from a frame loop.
 
 ### `hud.render()`
 
-Draw all tracks. Call at 10-15Hz (cold path).
+Draws all visible channels. Caller-throttled to ~10--15 Hz. No-op when `mountEl` is `null` or overlay is hidden.
 
-### `hud.resize()`
+### `hud.show() / hud.hide() / hud.destroy()`
 
-Recompute canvas size for the current `devicePixelRatio`. Called automatically on track registration and when the browser DPR changes (window dragged between monitors with different pixel density). Call manually if you resize a container the HUD is embedded in.
+`destroy()` removes the canvas from the DOM, removes the keydown listener, and calls `scope.removeSink()` if the scope provides it.
 
-### `hud.destroy()`
+---
 
-Remove canvas, keyboard listener, clear tracks.
+## Ring layout
 
-### `hud.visible`
+| Kind | Stride | Slots |
+|------|--------|-------|
+| LEVEL / INSTANT / COUNTER (width=1) | 3 | `[t, a, b]` |
+| Complete SPAN (non-paired) | 3 | `[t_start, duration_ms, 0]` |
+| Paired SPAN (closed) | 3 | `[t_open, t_close, correlId]` |
+| width=N (CONT) | 3N | primary `[t, a, b]` + (N-1) CONT triplets |
 
-Get/set visibility. The hotkey toggles this.
+Ring capacity = `pow2(ceil(hz × windowSec) + 1)` for LEVEL channels, `256` otherwise.
 
-## Threshold coloring
+---
 
-Each bar is colored by threshold:
+## Test suite
 
-- **`hi` set, `warnBelow` false (default):** green when at or below `hi`, amber when above. Use for frame time, draw calls, memory.
-- **`lo` set, `warnBelow` true:** green when at or above `lo`, amber when below. Use for FPS, throughput.
+```sh
+npm test
+# 59 tests, 0 failures
+```
 
-A dashed threshold line is drawn at the `hi` or `lo` value for visual reference.
+All tests run headless (`mountEl = null`). The mock scope factory in the test file is a useful reference for testing your own probes against the HUD.
 
-## Display
+---
 
-Each track shows: label, current value with unit, min/avg/max stats, and a bar chart of the ring buffer history. Colors cycle through a 6-color palette unless overridden.
+## Migration from v1
+
+### Channel creation
+
+```js
+// v1
+const fps = hud.track('fps', { hi: 120, lo: 0, warnBelow: 30 });
+fps.push(59.8);
+
+// v2 -- manual channel
+const fps = hud.channel({ name: 'fps', kind: 0 });
+fps.push(59.8);
+// Budget lines via attach option:
+hud.attach(scope, { budgets: [{ channel: 'fps', threshold: 30, label: 'min fps' }] });
+```
+
+### Scope integration
+
+```js
+// v1 -- HUD polled a memory sink separately
+// v2 -- HUD is a live mux sink
+hud.attach(scope);           // that's it
+```
+
+### Rendering
+
+```js
+// v1 and v2 -- same
+hud.render();  // call at ~10-15Hz
+```
+
+---
+
+## Protocol reference (SPP v1 constants, inlined)
+
+```
+Meta stream (sid 0):  EPOCH 0x0F00 | CONT 0x0F01 | VERDICT 0x0F40 | BUDGET_SET 0x0F41
+Kinds:                LEVEL 0 | INSTANT 1 | SPAN 2 | COUNTER 3
+```
+
+---
 
 ## License
 
-MIT (c) Zahary Shinikchiev
+MIT -- Copyright (c) 2026 Zahary Shinikchiev

@@ -1,45 +1,75 @@
-# @zakkster/lite-hud
+# @zakkster/lite-hud v2.0.0
 
-Single-canvas zero-GC perf overlay for browser applications.
+Zero-GC SPP-native canvas overlay for the @zakkster profiler suite.
+Single-file ESM (Hud.js). No runtime dependencies. MIT.
 
-## What it does
+## Model
 
-Renders a fixed-position canvas overlay with ring-buffer-backed tracks.
-Any profiler pushes values via track.push(value); the HUD renders bars,
-stats, and threshold coloring. stats.js replacement that allocates nothing
-per frame.
+- **Sink.** `hud` is a duck-typed SPP sink: `{ write(packed, t, a, b) }`.
+- **attach(scope).** Reads `scope.streams()` descriptors, builds LUT and per-channel Float64Array rings, calls `scope.addSink(hud_self)`.
+- **write(packed, t, a, b).** Hot path. Decodes `sid = (packed/65536)|0`, `op = (packed - sid*65536)|0` using arithmetic (not bitwise, to avoid Int32 sign extension for sid >= 0x8000). Routes via `lut[sid][op & 0xFF]`.
+
+## Protocol constants (inlined)
+
+```
+META_STREAM = 0     OP_EPOCH = 0x0F00   OP_CONT = 0x0F01
+OP_VERDICT  = 0x0F40   OP_BUDGET_SET = 0x0F41
+KIND_LEVEL=0  KIND_INSTANT=1  KIND_SPAN=2  KIND_COUNTER=3
+```
+
+## Ring layout
+
+Stride = `3 * width` per record: `[t, a, b]` for width=1.
+For CONT: `[t,a,b, c0,c1,c2]` (width=2) or `[t,a,b,c0,c1,c2,d0,d1,d2]` (width=3).
+Capacity = `pow2(ceil(hz * windowSec) + 1)` for LEVEL, else 256.
+Head advances in record units; bitmask = `cap - 1`.
+
+## Paired SPAN layout
+
+Ring record: `[t_open, t_close, correlId]`.
+Open pool: `Map<correlId, t_open>` per paired channel.
+
+## Complete SPAN layout (D5)
+
+Ring record: `[t_start, duration_ms, 0]`.
+Manual `push(durationMs)` synthesizes: `write(packed, now - dur, dur, 0)`.
+
+## BUDGET_SET (0x0F41)
+
+`a = interned_channel_name_id`, `b = threshold_value`.
+HUD resolves via `scope.label(a|0)` -> channel name match.
+DI alternative: `hud.attach(scope, { budgets: [{channel, threshold, label?}] })`.
+
+## Manual channels (D4)
+
+`hud.channel({ name?, unit?, hz?, kind? })` -> `{ push(v) }`.
+Synthetic stream IDs start at `0x8000` (arithmetic packed: `sid*65536 + opLow`).
+`push()` calls `write()` directly. One rendering truth.
 
 ## API
 
-createHud(canvas?, options?) -- create HUD, auto-creates canvas if null.
-  options: width, height, position, hotkey, zIndex, visible.
+```js
+import { createHud, VERSION } from '@zakkster/lite-hud';
+const hud = createHud(mountEl, { windowSec, position, hotkey, zIndex });
+hud.attach(scope, { budgets? });  // scope-driven channels
+const fps = hud.channel({ name: 'fps', kind: 0 }); fps.push(60); // manual
+hud.write(packed, t, a, b);       // direct SPP sink
+hud.stats();                      // { drops, channels, epoch, verdicts, budgets, channelStats }
+hud.inspect(name);                // { count, last: {t, a, b} } | null (cold path)
+hud.render();                     // draw at ~10-15Hz
+hud.show(); hud.hide(); hud.destroy();
+hud.visible; // getter
+```
 
-hud.track(name, options?) -- register a track, returns TrackHandle.
-  options: label, unit, lo, hi, warnBelow, color, samples.
+## Attach-time validation
 
-track.push(value) -- ZERO-GC HOT PATH. One typed-array write per call.
-track.peek() -- last value.
+- Throws on `op.code & 0xFF` collision within a single stream (SPP invariant).
+  Cross-stream reuse of the same low byte is fine.
+- CONT slots buffer is `Float64Array(3 * maxWidth)` per stream; any width
+  supported. Buffer grows if a later op needs more slots.
 
-hud.render() -- draw all tracks (cold path, call at 10-15Hz).
-hud.resize() -- recompute canvas dims for current DPR (auto on DPR change).
-hud.destroy() -- cleanup.
-hud.visible -- get/set visibility.
+## Conventions
 
-## Sink pattern
-
-Any profiler calls track.push(v) once per frame:
-  fpsTrack.push(fps);
-  frameTrack.push(dt);
-  gcTrack.push(bytesPerCall);
-  nodesTrack.push(activeNodes);
-
-The HUD renders them all on one canvas with independent ring buffers.
-
-## Threshold coloring
-
-hi set + warnBelow false: green below hi, amber above (frame time, draws).
-lo set + warnBelow true: green above lo, amber below (FPS, throughput).
-
-## Zero dependencies
-
-Single-file ESM. Canvas 2D only. No DOM manipulation on the hot path.
+- ASCII-only source. No console.log/debugger in shipped code.
+- `node:test` suite (59 tests). Run: `node --test test/Hud.test.js` or `npm test`.
+- sideEffects: false. MIT. Copyright Zahary Shinikchiev.
