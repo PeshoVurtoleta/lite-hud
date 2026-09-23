@@ -1,4 +1,4 @@
-// @zakkster/lite-hud 2.0.0
+// @zakkster/lite-hud 2.1.0
 // Copyright (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com>
 // MIT License
 
@@ -107,6 +107,24 @@ export interface InspectResult {
 
 export type HudPosition = 'top-right' | 'top-left' | 'bottom-right' | 'bottom-left';
 
+/**
+ * A `@zakkster/lite-viewport`-style Viewport CLASS (a constructor). The HUD owns
+ * the canvas and passes `{ canvas, maxDpr, onResize }`; it reads `.ctx` / `.dpr`
+ * and calls `.resize()` / `.destroy()`.
+ */
+export interface ViewportInstance {
+  ctx: CanvasRenderingContext2D;
+  dpr: number;
+  resize(): void;
+  destroy(): void;
+}
+export interface ViewportOptions {
+  canvas: HTMLCanvasElement;
+  maxDpr?: number;
+  onResize?: (width: number, height: number, dpr: number) => void;
+}
+export type ViewportClass = new (opts: ViewportOptions) => ViewportInstance;
+
 export interface HudOptions {
   position?: HudPosition;
   /** Key that toggles overlay visibility. Default: '`'. Set '' to disable. */
@@ -114,6 +132,21 @@ export interface HudOptions {
   zIndex?: number;
   /** Width of the scrolling time window in seconds. Default: 5. */
   windowSec?: number;
+  /**
+   * Optional DPR-aware renderer: a Viewport CLASS (constructor function). When
+   * given, the HUD creates a sized wrapper `<div>` + canvas, constructs
+   * `new viewport({ canvas, maxDpr, onResize })`, and renders through its
+   * `ctx` / `dpr`. Omitted -> the inline DPR fallback path. Must be a function;
+   * anything else throws (`@zakkster/lite-hud:` prefix), fail-closed.
+   */
+  viewport?: ViewportClass;
+  /**
+   * Cap devicePixelRatio for the backing store (a 3x phone triples fill-rate
+   * for no visible gain). A finite number >= 1, or Infinity (no cap; default).
+   * Applies to both the injected viewport and the inline fallback. Anything
+   * else throws (`@zakkster/lite-hud:` prefix), fail-closed.
+   */
+  maxDpr?: number;
 }
 
 export interface Hud extends SppSink {

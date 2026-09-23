@@ -1,4 +1,4 @@
-// @zakkster/lite-hud 2.0.0
+// @zakkster/lite-hud 2.1.0
 // SPP-native zero-GC canvas overlay. Channels from scope registry, trigger
 // cursors from gate verdicts and budget lines, legend with per-channel
 // visibility toggle. Drop-in stats.js replacement via hud.channel().
@@ -6,7 +6,7 @@
 // Copyright (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com>
 // MIT License
 
-export const VERSION = '2.0.0';
+export const VERSION = '2.1.0';
 
 // ---------------------------------------------------------------------------
 // SPP v1 protocol constants -- inlined, never imported
@@ -35,6 +35,148 @@ function pow2(n) {
 
 function nowMs() {
     return (typeof performance !== 'undefined') ? performance.now() : Date.now();
+}
+
+// ---------------------------------------------------------------------------
+// Paired-span open pool -- inline integer-keyed open-addressing map.
+// Design-parity with the CuckooMap idiom (no dep). Replaces the JS Map that
+// allocated an entry per open + an iterator per eviction on the WRITE path.
+// Float64Array correlId keys + t_open, Uint8Array occupancy (id 0 legal),
+// linear probe + backshift delete, slots = pow2 >= 2*cap (load <= 0.5), and a
+// Float64Array FIFO (key + seq) for O(1) oldest-first eviction with lazy skip
+// of closed/reinserted entries. All functions are module-scope (0-alloc, no
+// closure captured per op); the arrays are allocated once at attach (cold).
+// ---------------------------------------------------------------------------
+
+// Scratch view: hash the lo/hi 32-bit lanes of an f64 key (allocated once).
+const _keyF64 = new Float64Array(1);
+const _keyU32 = new Uint32Array(_keyF64.buffer);
+
+function hashKey(k) {
+    _keyF64[0] = k;
+    let h = (_keyU32[0] ^ _keyU32[1]) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+    return (h ^ (h >>> 16)) >>> 0;
+}
+
+function initPairedPool(ch) {
+    const slots = pow2(ch.cap * 2);
+    ch.poolSlots = slots;
+    ch.poolMask = slots - 1;
+    ch.poolKeys = new Float64Array(slots);
+    ch.poolTOpen = new Float64Array(slots);
+    ch.poolOcc = new Uint8Array(slots);
+    ch.poolSeq = new Float64Array(slots);
+    ch.poolSize = 0;
+    ch.poolNextSeq = 1;
+    ch.fifoCap = slots;
+    ch.fifoMask = slots - 1;
+    ch.fifoKey = new Float64Array(slots);
+    ch.fifoSeq = new Float64Array(slots);
+    ch.fifoHead = 0;
+    ch.fifoCount = 0;
+}
+
+// Exact-compare probe. Returns the slot index or -1.
+function poolFind(ch, k) {
+    const mask = ch.poolMask, occ = ch.poolOcc, keys = ch.poolKeys;
+    let i = hashKey(k) & mask;
+    while (occ[i]) {
+        if (keys[i] === k) return i;
+        i = (i + 1) & mask;
+    }
+    return -1;
+}
+
+// Insert a NEW key (caller guarantees k is absent and poolSize < cap).
+function poolInsert(ch, k, t) {
+    const mask = ch.poolMask, occ = ch.poolOcc;
+    let i = hashKey(k) & mask;
+    while (occ[i]) i = (i + 1) & mask;
+    ch.poolKeys[i] = k;
+    ch.poolTOpen[i] = t;
+    occ[i] = 1;
+    const seq = ch.poolNextSeq;
+    ch.poolNextSeq = seq + 1;
+    ch.poolSeq[i] = seq;
+    ch.poolSize++;
+    fifoPush(ch, k, seq);
+}
+
+// Backshift delete (Knuth Algorithm R) -- keeps probe chains contiguous.
+function poolDelete(ch, i) {
+    const mask = ch.poolMask;
+    const keys = ch.poolKeys, occ = ch.poolOcc, tOpen = ch.poolTOpen, pseq = ch.poolSeq;
+    let j = i;
+    while (true) {
+        occ[i] = 0;
+        while (true) {
+            j = (j + 1) & mask;
+            if (!occ[j]) { ch.poolSize--; return; }
+            const home = hashKey(keys[j]) & mask;
+            // Keep scanning while the entry at j must stay (its home is cyclically
+            // in (i, j]); break to move it into the hole at i otherwise.
+            const inGap = (i <= j) ? (i < home && home <= j) : (i < home || home <= j);
+            if (!inGap) break;
+        }
+        keys[i] = keys[j];
+        tOpen[i] = tOpen[j];
+        pseq[i] = pseq[j];
+        occ[i] = 1;
+        i = j;
+    }
+}
+
+function fifoPush(ch, k, seq) {
+    if (ch.fifoCount === ch.fifoCap) fifoCompact(ch);
+    const p = (ch.fifoHead + ch.fifoCount) & ch.fifoMask;
+    ch.fifoKey[p] = k;
+    ch.fifoSeq[p] = seq;
+    ch.fifoCount++;
+}
+
+// In-place ring compaction: drop FIFO entries whose (key, seq) no longer matches
+// a live pool slot. Only fires when the ring is full; slots >= 2*cap guarantees
+// at least cap stale entries to reclaim, so it stays bounded + amortized O(1)
+// and allocates nothing. Writes trail reads (w <= r), so no unread slot is
+// clobbered.
+function fifoCompact(ch) {
+    const mask = ch.fifoMask, head = ch.fifoHead, count = ch.fifoCount;
+    const fk = ch.fifoKey, fs = ch.fifoSeq;
+    let w = 0;
+    for (let r = 0; r < count; r++) {
+        const rp = (head + r) & mask;
+        const k = fk[rp];
+        const sq = fs[rp];
+        const slot = poolFind(ch, k);
+        if (slot >= 0 && ch.poolSeq[slot] === sq) {
+            const wp = (head + w) & mask;
+            fk[wp] = k;
+            fs[wp] = sq;
+            w++;
+        }
+    }
+    ch.fifoCount = w;
+}
+
+// Evict the oldest still-open entry (FIFO order, lazily skipping stale entries).
+// Same observable behavior as today's Map.keys().next(). Returns true on evict.
+function poolEvictOldest(ch) {
+    const mask = ch.fifoMask;
+    while (ch.fifoCount > 0) {
+        const hp = ch.fifoHead;
+        const k = ch.fifoKey[hp];
+        const sq = ch.fifoSeq[hp];
+        ch.fifoHead = (ch.fifoHead + 1) & mask;
+        ch.fifoCount--;
+        const slot = poolFind(ch, k);
+        if (slot >= 0 && ch.poolSeq[slot] === sq) {
+            poolDelete(ch, slot);
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -69,14 +211,33 @@ function makeChannel(idx, sid, name, unit, hz, kind, width, winSec) {
         head: 0,
         count: 0,
         visible: true,
-        // Paired span: open op and close op route to the same channel.
-        // openPool holds (correlId -> t_open) until close arrives.
+        // Paired span: open op and close op route to the same channel. The
+        // inline open pool (below) holds (correlId -> t_open) until close
+        // arrives. Allocated at attach (cold) via initPairedPool.
         paired: false,
         openOpLow: -1,
         closeOpLow: -1,
-        openPool: null,
-        // Budget threshold lines: [{threshold, label}]
+        poolSlots: 0,
+        poolMask: 0,
+        poolKeys: null,
+        poolTOpen: null,
+        poolOcc: null,
+        poolSeq: null,
+        poolSize: 0,
+        poolNextSeq: 1,
+        fifoCap: 0,
+        fifoMask: 0,
+        fifoKey: null,
+        fifoSeq: null,
+        fifoHead: 0,
+        fifoCount: 0,
+        // DI budget threshold lines (cold, at attach): [{threshold, label}]
         budgets: [],
+        // Meta BUDGET_SET slot: preallocated; a repeat for this channel REPLACES
+        // the threshold (never appends -> no per-record object, no retention).
+        metaBudgetActive: false,
+        metaBudgetThreshold: 0,
+        metaBudgetLabel: '',
         // Precomputed hit zones for legend click detection (set in render)
         hitY0: 0,
         hitY1: 0,
@@ -152,6 +313,23 @@ export function createHud(mountEl, opts) {
     const pos = o.position || 'top-right';
     const zIdx = o.zIndex || 9999;
 
+    // -- Fail-closed option validation (before any DOM work) --------------------
+    // viewport: a Viewport CLASS (the HUD creates the canvas), not an instance.
+    const viewportClass = o.viewport;
+    if (viewportClass !== undefined && typeof viewportClass !== 'function') {
+        throw new Error(
+            '@zakkster/lite-hud: viewport must be a Viewport class (a constructor ' +
+            'function), got ' + typeof viewportClass);
+    }
+    // maxDpr: a finite number >= 1, or Infinity (no cap). NaN / < 1 fail closed.
+    const _maxDpr = o.maxDpr === undefined ? Infinity : o.maxDpr;
+    if (!(_maxDpr === Infinity ||
+          (typeof _maxDpr === 'number' && Number.isFinite(_maxDpr) && _maxDpr >= 1))) {
+        throw new Error(
+            '@zakkster/lite-hud: maxDpr must be a finite number >= 1 or Infinity, got ' +
+            String(o.maxDpr));
+    }
+
     // -- State ------------------------------------------------------------------
     const channels = [];
     // lut: sparse Array[sid] -> Array[opLow] -> { chIdx, role }
@@ -179,6 +357,9 @@ export function createHud(mountEl, opts) {
     let canvas = null;
     let ctx = null;
     let dpr = 1;
+    // Injected viewport instance + its HUD-owned wrapper div (peer render path)
+    let vp = null;
+    let wrapper = null;
 
     // -- LUT helpers ------------------------------------------------------------
 
@@ -237,32 +418,9 @@ export function createHud(mountEl, opts) {
             return;
         }
 
-        // Meta stream
+        // Meta stream -- handled on a cold helper, off the hot body.
         if (sid === META_STREAM) {
-            if (op === OP_EPOCH) {
-                epoch = t;
-                sppVersion = a;
-            } else if (op === OP_VERDICT) {
-                const vb = (verdictHead * 3) | 0;
-                verdictRing[vb] = t;
-                verdictRing[vb + 1] = b; // 0 pass / 1 fail / 3 recapture
-                verdictRing[vb + 2] = a; // interned budget id
-                verdictHead = (verdictHead + 1) & (VCAP - 1);
-                verdictCount++;
-            } else if (op === OP_BUDGET_SET) {
-                // a = interned channel name id, b = threshold value
-                if (_scope) {
-                    const lbl = _scope.label(a | 0);
-                    if (lbl) {
-                        for (let ci = 0; ci < channels.length; ci++) {
-                            if (channels[ci].name === lbl) {
-                                channels[ci].budgets.push({threshold: b, label: lbl});
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            metaWrite(op, t, a, b);
             return;
         }
 
@@ -285,20 +443,29 @@ export function createHud(mountEl, opts) {
             return;
         }
 
-        // Paired span
+        // Paired span -- inline open-addressing pool, zero-alloc open/close.
         if (ch.paired) {
             if (entry.role === 'open') {
-                if (ch.openPool.size >= ch.cap) {
-                    // Evict one to prevent unbounded growth; count as drop.
-                    ch.openPool.delete(ch.openPool.keys().next().value);
-                    drops++;
+                let k = a;
+                if (k !== k) { drops++; return; }   // NaN correlId on open -> drop
+                if (k === 0) k = 0;                  // normalize -0 to +0
+                // Bound growth: evict oldest still-open entry, count as a drop
+                // (matches today's Map.keys().next() eviction on a full pool).
+                if (ch.poolSize >= ch.cap) { poolEvictOldest(ch); drops++; }
+                const slot = poolFind(ch, k);
+                if (slot >= 0) {
+                    ch.poolTOpen[slot] = t; // re-open: overwrite t_open, position kept
+                } else {
+                    poolInsert(ch, k, t);
                 }
-                ch.openPool.set(a, t);
             } else if (entry.role === 'close') {
-                const tOpen = ch.openPool.get(a);
-                if (tOpen !== undefined) {
-                    ch.openPool.delete(a);
-                    ringWrite(ch, tOpen, t, a); // [t_open, t_close, correlId]
+                let k = a;
+                if (k === 0) k = 0;                  // normalize -0 to +0
+                const slot = poolFind(ch, k);
+                if (slot >= 0) {
+                    const tOpen = ch.poolTOpen[slot];
+                    poolDelete(ch, slot);
+                    ringWrite(ch, tOpen, t, k); // [t_open, t_close, correlId]
                 }
                 // close without matching open: silently skip (open may have been evicted)
             }
@@ -323,6 +490,39 @@ export function createHud(mountEl, opts) {
 
         // Standard width=1 record
         ringWrite(ch, t, a, b);
+    }
+
+    // -- metaWrite() -- cold meta-stream handler, off the write() hot body -------
+
+    function metaWrite(op, t, a, b) {
+        if (op === OP_EPOCH) {
+            epoch = t;
+            sppVersion = a;
+        } else if (op === OP_VERDICT) {
+            const vb = (verdictHead * 3) | 0;
+            verdictRing[vb] = t;
+            verdictRing[vb + 1] = b; // 0 pass / 1 fail / 3 recapture
+            verdictRing[vb + 2] = a; // interned budget id
+            verdictHead = (verdictHead + 1) & (VCAP - 1);
+            verdictCount++;
+        } else if (op === OP_BUDGET_SET) {
+            // a = interned channel name id, b = threshold value. A repeat for a
+            // channel REPLACES its meta budget in a preallocated slot -- no object
+            // is allocated per record, no unbounded append.
+            if (_scope) {
+                const lbl = _scope.label(a | 0);
+                if (lbl) {
+                    for (let ci = 0; ci < channels.length; ci++) {
+                        if (channels[ci].name === lbl) {
+                            channels[ci].metaBudgetActive = true;
+                            channels[ci].metaBudgetThreshold = b;
+                            channels[ci].metaBudgetLabel = lbl;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -- attach() ---------------------------------------------------------------
@@ -372,7 +572,7 @@ export function createHud(mountEl, opts) {
                 ch.paired = true;
                 ch.openOpLow = openOp.code & 0xFF;
                 ch.closeOpLow = closeOp.code & 0xFF;
-                ch.openPool = new Map();
+                initPairedPool(ch);
                 channels.push(ch);
                 registerOp(sd.id, ch.openOpLow, ch.idx, 'open');
                 registerOp(sd.id, ch.closeOpLow, ch.idx, 'close');
@@ -438,7 +638,8 @@ export function createHud(mountEl, opts) {
         let totalBudgets = 0;
         const channelStats = new Array(channels.length);
         for (let ci = 0; ci < channels.length; ci++) {
-            totalBudgets += channels[ci].budgets.length;
+            totalBudgets += channels[ci].budgets.length +
+                (channels[ci].metaBudgetActive ? 1 : 0);
             channelStats[ci] = {name: channels[ci].name, count: channels[ci].count, head: channels[ci].head};
         }
         return {
@@ -467,49 +668,128 @@ export function createHud(mountEl, opts) {
 
     // -- Canvas overlay ---------------------------------------------------------
 
-    function setupCanvas() {
-        if (!mountEl || typeof document === 'undefined') return;
-        const prev = document.getElementById('__lite_hud__');
-        if (prev) prev.remove();
+    // Total overlay height in CSS px for the current channel count.
+    function totalHeight() {
+        const chn = channels.length || 1;
+        return PAD + chn * (ROW_H + PAD) + 14 + PAD;
+    }
 
-        canvas = document.createElement('canvas');
-        canvas.id = '__lite_hud__';
-        Object.assign(canvas.style, {
-            position: 'fixed',
-            zIndex: String(zIdx),
-            imageRendering: 'pixelated',
-            cursor: 'pointer',
-            fontSmoothing: 'none',
-        });
+    // [verticalEdge, horizontalEdge] CSS properties for the configured corner.
+    function posEdges() {
         const POS = {
             'top-right': ['top', 'right'],
             'top-left': ['top', 'left'],
             'bottom-right': ['bottom', 'right'],
             'bottom-left': ['bottom', 'left'],
         };
-        const [v, h] = POS[pos] || ['top', 'right'];
-        canvas.style[v] = PAD + 'px';
-        canvas.style[h] = PAD + 'px';
+        return POS[pos] || ['top', 'right'];
+    }
 
-        resize();
-        canvas.addEventListener('pointerdown', onCanvasPointer);
+    function setupCanvas() {
+        if (!mountEl || typeof document === 'undefined') return;
+        const prev = document.getElementById('__lite_hud__');
+        if (prev) prev.remove();
+        const prevW = document.getElementById('__lite_hud_wrap__');
+        if (prevW) prevW.remove();
+
+        canvas = document.createElement('canvas');
+        canvas.id = '__lite_hud__';
         const parent = mountEl.appendChild ? mountEl : document.body;
-        parent.appendChild(canvas);
+        const [v, h] = posEdges();
+
+        if (viewportClass) {
+            // HUD-owned wrapper: it carries positioning + the HUD's own size, so
+            // the injected Viewport measures the HUD (not the page) and the canvas
+            // fills it. Positioning styles live on the wrapper, never the canvas.
+            wrapper = document.createElement('div');
+            wrapper.id = '__lite_hud_wrap__';
+            Object.assign(wrapper.style, {
+                position: 'fixed',
+                zIndex: String(zIdx),
+                width: HUD_W + 'px',
+                height: totalHeight() + 'px',
+                pointerEvents: 'none',
+            });
+            wrapper.style[v] = PAD + 'px';
+            wrapper.style[h] = PAD + 'px';
+            Object.assign(canvas.style, {
+                display: 'block',
+                width: '100%',
+                height: '100%',
+                imageRendering: 'pixelated',
+                cursor: 'pointer',
+                pointerEvents: 'auto',
+            });
+            wrapper.appendChild(canvas);
+            // The wrapper must be live in the host DOM before the Viewport is
+            // constructed (it measures the wrapper). If the injected constructor
+            // throws, fail CLOSED: detach the wrapper, drop any partial viewport,
+            // reset state, and rethrow the original error -- nothing may be left
+            // attached to the caller's mount when createHud() throws.
+            parent.appendChild(wrapper);
+            try {
+                vp = new viewportClass({
+                    canvas,
+                    maxDpr: _maxDpr,
+                    onResize: onVpResize,
+                });
+                ctx = vp.ctx;
+                dpr = vp.dpr;
+            } catch (err) {
+                if (vp && typeof vp.destroy === 'function') {
+                    try { vp.destroy(); } catch (_) { /* ignore secondary error */ }
+                }
+                wrapper.remove();
+                wrapper = null;
+                vp = null;
+                canvas = null;
+                ctx = null;
+                throw err;
+            }
+            // Only after the fallible construction succeeds do we attach the
+            // pointer listener, so a throw above leaks no listener either.
+            canvas.addEventListener('pointerdown', onCanvasPointer);
+        } else {
+            Object.assign(canvas.style, {
+                position: 'fixed',
+                zIndex: String(zIdx),
+                imageRendering: 'pixelated',
+                cursor: 'pointer',
+                fontSmoothing: 'none',
+            });
+            canvas.style[v] = PAD + 'px';
+            canvas.style[h] = PAD + 'px';
+            resize();
+            canvas.addEventListener('pointerdown', onCanvasPointer);
+            parent.appendChild(canvas);
+        }
 
         if (hotkey) document.addEventListener('keydown', onKey);
     }
 
+    // Viewport onResize callback: pick up the new dpr/ctx and redraw. render()
+    // no-ops until ctx is wired (the constructor's initial resize fires early).
+    function onVpResize() {
+        if (vp) { dpr = vp.dpr; ctx = vp.ctx; }
+        render();
+    }
+
+    // Fallback (no viewport) DPR-aware sizing. Reset the transform to identity
+    // BEFORE scaling so repeated resizes never compound (scale(2)*scale(2)).
     function resize() {
         if (!canvas) return;
-        dpr = (typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1) || 1;
-        const ch = channels.length || 1;
-        const tot = PAD + ch * (ROW_H + PAD) + 14 + PAD;
+        const raw = (typeof devicePixelRatio !== 'undefined' ? devicePixelRatio : 1) || 1;
+        dpr = Math.min(raw, _maxDpr);
+        const tot = totalHeight();
         canvas.width = HUD_W * dpr;
         canvas.height = tot * dpr;
         canvas.style.width = HUD_W + 'px';
         canvas.style.height = tot + 'px';
         ctx = canvas.getContext('2d');
-        if (ctx) ctx.scale(dpr, dpr);
+        if (ctx) {
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.scale(dpr, dpr);
+        }
     }
 
     // -- render() -- cold path, caller-throttled --------------------------------
@@ -522,11 +802,21 @@ export function createHud(mountEl, opts) {
         const tMax = now;
         const W = HUD_W;
         const cw = W - LBL_W - PAD * 2;
-        const H = canvas.height / dpr;
 
-        // Lazy height resize if channels added since last render
-        const neededH = PAD + channels.length * (ROW_H + PAD) + 14 + PAD;
-        if (H < neededH) resize();
+        // Lazy height resize if channels were added since the last render. With a
+        // viewport, grow the wrapper and resize synchronously (its RO/RAF path is
+        // async); otherwise re-size the canvas directly.
+        const neededH = totalHeight();
+        if (vp) {
+            const curH = wrapper ? (parseFloat(wrapper.style.height) || 0) : 0;
+            if (curH < neededH) {
+                if (wrapper) wrapper.style.height = neededH + 'px';
+                vp.resize();
+            }
+        } else {
+            if (canvas.height / dpr < neededH) resize();
+        }
+        const H = canvas.height / dpr;
 
         // Background
         ctx.fillStyle = C_BG;
@@ -605,16 +895,19 @@ export function createHud(mountEl, opts) {
                     if (bv < mn) mn = bv;
                     if (bv > mx) mx = bv;
                 }
+                if (ch.metaBudgetActive) {
+                    const bv = ch.metaBudgetThreshold;
+                    if (bv < mn) mn = bv;
+                    if (bv > mx) mx = bv;
+                }
                 const range = mx === mn ? 1 : mx - mn;
 
                 function yOf(v) {
                     return rowY + ROW_H - 2 - ((v - mn) / range) * (ROW_H - 6);
                 }
 
-                // Budget threshold lines
-                ctx.setLineDash([3, 3]);
-                for (let bi = 0; bi < ch.budgets.length; bi++) {
-                    const by = yOf(ch.budgets[bi].threshold);
+                function drawBudgetLine(threshold, label) {
+                    const by = yOf(threshold);
                     ctx.strokeStyle = C_BUDGET;
                     ctx.lineWidth = 1;
                     ctx.beginPath();
@@ -623,7 +916,16 @@ export function createHud(mountEl, opts) {
                     ctx.stroke();
                     ctx.fillStyle = C_BUDGET;
                     ctx.font = '7px monospace';
-                    ctx.fillText(ch.budgets[bi].label || '', LBL_W + PAD + 2, by - 2);
+                    ctx.fillText(label || '', LBL_W + PAD + 2, by - 2);
+                }
+
+                // Budget threshold lines (DI budgets + the meta BUDGET_SET slot)
+                ctx.setLineDash([3, 3]);
+                for (let bi = 0; bi < ch.budgets.length; bi++) {
+                    drawBudgetLine(ch.budgets[bi].threshold, ch.budgets[bi].label);
+                }
+                if (ch.metaBudgetActive) {
+                    drawBudgetLine(ch.metaBudgetThreshold, ch.metaBudgetLabel);
                 }
                 ctx.setLineDash([]);
 
@@ -719,10 +1021,12 @@ export function createHud(mountEl, opts) {
                     ctx.lineWidth = 1;
                     ctx.strokeRect(x0, rowY + 6, x1 - x0, ROW_H - 12);
                 }
-                // Open (unclosed) spans render to the window right edge
-                if (ch.paired && ch.openPool) {
-                    for (const [, tOpen] of ch.openPool) {
-                        const x0 = Math.max(xOf(tOpen), LBL_W + PAD);
+                // Open (unclosed) spans render to the window right edge. Cold
+                // path: scan the pool slots directly (no iterator allocation).
+                if (ch.paired && ch.poolOcc) {
+                    for (let si = 0; si < ch.poolSlots; si++) {
+                        if (!ch.poolOcc[si]) continue;
+                        const x0 = Math.max(xOf(ch.poolTOpen[si]), LBL_W + PAD);
                         if (x0 >= W - PAD) continue;
                         ctx.fillStyle = C_SPAN_OPE;
                         ctx.fillRect(x0, rowY + 6, W - PAD - x0, ROW_H - 12);
@@ -796,18 +1100,22 @@ export function createHud(mountEl, opts) {
 
     function show() {
         _visible = true;
-        if (canvas) canvas.style.display = '';
+        const el = wrapper || canvas;
+        if (el) el.style.display = '';
     }
 
     function hide() {
         _visible = false;
-        if (canvas) canvas.style.display = 'none';
+        const el = wrapper || canvas;
+        if (el) el.style.display = 'none';
     }
 
     function destroy() {
         if (canvas) {
             canvas.removeEventListener('pointerdown', onCanvasPointer);
-            canvas.remove();
+            if (vp) { vp.destroy(); vp = null; }
+            if (wrapper) { wrapper.remove(); wrapper = null; }
+            else canvas.remove();
             canvas = null;
             ctx = null;
         }

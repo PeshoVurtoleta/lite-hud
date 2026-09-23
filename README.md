@@ -89,8 +89,37 @@ same demux path used by scope probes. There is no separate ring or draw path.
 | `position` | `'top-right' \| 'top-left' \| 'bottom-right' \| 'bottom-left'` | `'top-right'` | Canvas corner |
 | `hotkey` | `string` | `` '`' `` | Key that toggles visibility. `''` to disable |
 | `zIndex` | `number` | `9999` | CSS z-index of the canvas |
+| `viewport` | Viewport CLASS | `undefined` | Optional DPR-aware renderer (see below). Must be a constructor function, else throws |
+| `maxDpr` | `number` | `Infinity` | Cap devicePixelRatio for the backing store. Finite `>= 1` or `Infinity`, else throws |
 
 Pass `null` as `mountEl` for headless / test mode. All DOM and canvas operations are skipped; the full state layer remains active.
+
+#### DPR-correct rendering (`viewport` + `maxDpr`)
+
+By default the HUD sizes its own canvas from `devicePixelRatio` (capped at
+`maxDpr`) and resets the transform before scaling on every resize, so repeated
+resizes never compound.
+
+Inject a [`@zakkster/lite-viewport`](https://www.npmjs.com/package/@zakkster/lite-viewport)
+Viewport **class** for a resize-aware, DPR-change-aware backing store:
+
+```js
+import { createHud } from '@zakkster/lite-hud';
+import { Viewport } from '@zakkster/lite-viewport';
+
+const hud = createHud(document.body, { viewport: Viewport, maxDpr: 2 });
+```
+
+The HUD owns a sized wrapper `<div>` (positioning moves to it, the canvas sits
+inside) so the viewport measures the HUD, not the page; it constructs
+`new Viewport({ canvas, maxDpr, onResize })`, renders through `vp.ctx` / `vp.dpr`,
+calls `vp.resize()` synchronously when the row count grows, and tears the viewport
+down in `destroy()`. `@zakkster/lite-viewport` is an **optional peer dependency**:
+with none installed, the inline fallback path above is used and nothing regresses.
+
+`viewport` must be a function (a class); `maxDpr` must be a finite number `>= 1`
+or `Infinity`. Either violation throws with the `@zakkster/lite-hud:` prefix
+before any DOM work (fail-closed).
 
 ---
 
@@ -183,11 +212,50 @@ Ring capacity = `pow2(ceil(hz × windowSec) + 1)` for LEVEL channels, `256` othe
 
 ---
 
+## Zero-GC (witnessed)
+
+The write path performs zero LIBRARY-OWNED allocation. Every record kind, the
+paired open/close path, the pool eviction churn, and meta records are 0 B/op --
+the rings and the paired-span open pool are fixed typed arrays allocated once at
+attach and never reallocated or grown. Render is a disclosed COLD path
+(caller-throttled to ~10-15 Hz) and may allocate to draw.
+
+The one caller-side caveat: a DISTINCT fractional double passed as an argument is
+boxed by V8 at the JS call boundary (a ~16 B transient nursery HeapNumber, never
+retained), exactly as for any JS function taking a double. Storing a fractional
+MAGNITUDE into the ring costs nothing (a reused constant is witnessed at 0 in the
+perf gate); only a varying distinct fractional value boxes, caller-side.
+
+| Write-path op | Bytes/op | Witnessed by |
+|---------------|----------|--------------|
+| `write()` LEVEL / INSTANT / COUNTER | 0 | torture + perf gate |
+| `write()` CONT-chained wide record | 0 | torture + perf gate |
+| `write()` complete (D5) SPAN | 0 | torture + perf gate |
+| paired SPAN open + close | 0 | torture + perf gate |
+| paired pool eviction churn (backshift + FIFO) | 0 | torture + perf gate |
+| meta EPOCH / VERDICT / BUDGET_SET (replace) | 0 | torture + perf gate |
+| `channel().push()` (all kinds) | 0 retained | torture |
+| Retained growth over fill/clear cycles | 0 | torture (arrayBuffers flat) |
+| GC major collections over the window | 0 | torture |
+
+`channel().push()` reads wall-clock time (`performance.now()`, a fractional
+double); V8 boxes a fractional double as a transient nursery value when passing
+it to a large function, so it is gated on the RETAINED lane (torture, 0 B/op),
+not the scavenge lane -- the box is orthogonal to lite-hud's own allocation.
+
+```sh
+node --expose-gc test/torture.mjs   # lite-leak + lite-gc-profiler
+npm run test:perf                    # lite-perf-gate (0 scavenges, must-fail control)
+npm run verify                       # test + torture + torture:controls + test:perf
+```
+
+---
+
 ## Test suite
 
 ```sh
 npm test
-# 59 tests, 0 failures
+# 80 tests, 0 failures
 ```
 
 All tests run headless (`mountEl = null`). The mock scope factory in the test file is a useful reference for testing your own probes against the HUD.

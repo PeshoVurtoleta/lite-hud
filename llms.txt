@@ -1,7 +1,8 @@
-# @zakkster/lite-hud v2.0.0
+# @zakkster/lite-hud v2.1.0
 
 Zero-GC SPP-native canvas overlay for the @zakkster profiler suite.
 Single-file ESM (Hud.js). No runtime dependencies. MIT.
+Optional peer: @zakkster/lite-viewport (injected as a CLASS; inline DPR fallback otherwise).
 
 ## Model
 
@@ -27,7 +28,13 @@ Head advances in record units; bitmask = `cap - 1`.
 ## Paired SPAN layout
 
 Ring record: `[t_open, t_close, correlId]`.
-Open pool: `Map<correlId, t_open>` per paired channel.
+Open pool: an inline integer-keyed open-addressing map per paired channel
+(Float64Array correlId + t_open, Uint8Array occupancy so id 0 is legal, linear
+probe + backshift delete, slots = pow2 >= 2*cap). Allocated at attach (cold);
+zero-alloc on open/close. Oldest-first eviction when full via a Float64Array FIFO
+of open keys with a per-slot sequence for lazy skip (drops++). NaN correlId on
+open = a counted drop; `-0` normalizes to `+0`; re-open of an open key overwrites
+t_open and keeps its FIFO position (Map.set semantics).
 
 ## Complete SPAN layout (D5)
 
@@ -38,7 +45,10 @@ Manual `push(durationMs)` synthesizes: `write(packed, now - dur, dur, 0)`.
 
 `a = interned_channel_name_id`, `b = threshold_value`.
 HUD resolves via `scope.label(a|0)` -> channel name match.
-DI alternative: `hud.attach(scope, { budgets: [{channel, threshold, label?}] })`.
+A repeat BUDGET_SET for a channel REPLACES its threshold in a preallocated
+per-channel slot -- no object allocated per record, no unbounded append.
+DI alternative (cold, at attach): `hud.attach(scope, { budgets: [{channel, threshold, label?}] })`.
+Both kinds render as dashed threshold lines.
 
 ## Manual channels (D4)
 
@@ -50,7 +60,7 @@ Synthetic stream IDs start at `0x8000` (arithmetic packed: `sid*65536 + opLow`).
 
 ```js
 import { createHud, VERSION } from '@zakkster/lite-hud';
-const hud = createHud(mountEl, { windowSec, position, hotkey, zIndex });
+const hud = createHud(mountEl, { windowSec, position, hotkey, zIndex, viewport, maxDpr });
 hud.attach(scope, { budgets? });  // scope-driven channels
 const fps = hud.channel({ name: 'fps', kind: 0 }); fps.push(60); // manual
 hud.write(packed, t, a, b);       // direct SPP sink
@@ -68,8 +78,35 @@ hud.visible; // getter
 - CONT slots buffer is `Float64Array(3 * maxWidth)` per stream; any width
   supported. Buffer grows if a later op needs more slots.
 
+## Rendering (viewport / maxDpr)
+
+- `viewport`: a Viewport CLASS (typeof 'function', else throws with the
+  `@zakkster/lite-hud:` prefix). Injected -> the HUD owns a sized wrapper `<div>`
+  (positioning moves to it, canvas inside) so the viewport measures the HUD, not
+  the page; `new viewport({ canvas, maxDpr, onResize })`; uses `vp.ctx` / `vp.dpr`;
+  row growth sets wrapper height + calls `vp.resize()` synchronously; `destroy()`
+  calls `vp.destroy()` and removes the wrapper.
+- `maxDpr`: finite number >= 1, or Infinity (default, no cap); else throws. Caps
+  devicePixelRatio for the backing store. Fallback path (no viewport) keeps the
+  inline DOM + `setTransform(1,0,0,1,0,0)` before `scale(dpr,dpr)` (no cumulative
+  scaling) + the maxDpr cap.
+
+## Zero-GC (witnessed)
+
+- Zero LIBRARY-OWNED allocation: `write()` (every record kind), paired open+close,
+  pool eviction churn, and meta records are 0 B/op: `node --expose-gc test/torture.mjs`
+  (lite-leak + lite-gc-profiler; retained lane + a paired-span scavenge lane) +
+  `test/perf/PerfGate.test.mjs` (lite-perf-gate, 0 scavenges).
+- Caveat: a DISTINCT fractional double passed as an argument is boxed by V8 at the
+  JS call boundary (~16 B transient, never retained), like any JS function taking a
+  double; storing a fractional magnitude into the ring costs nothing (a reused
+  constant is witnessed at 0). channel().push() reads wall-clock time, so it is
+  gated on the RETAINED lane (torture, 0 B/op), not the scavenge lane.
+- Render is a disclosed COLD path (caller-throttled ~10-15 Hz) and may allocate.
+
 ## Conventions
 
 - ASCII-only source. No console.log/debugger in shipped code.
-- `node:test` suite (59 tests). Run: `node --test test/Hud.test.js` or `npm test`.
+- `node:test` suite (80 tests). Run: `node --test test/Hud.test.js` or `npm test`.
+- Gates: `npm run torture` / `torture:controls` / `test:perf` / `verify`.
 - sideEffects: false. MIT. Copyright Zahary Shinikchiev.
