@@ -1,8 +1,9 @@
-# @zakkster/lite-hud v2.1.0
+# @zakkster/lite-hud v2.2.0
 
 Zero-GC SPP-native canvas overlay for the @zakkster profiler suite.
 Single-file ESM (Hud.js). No runtime dependencies. MIT.
 Optional peer: @zakkster/lite-viewport (injected as a CLASS; inline DPR fallback otherwise).
+Optional peer: @zakkster/lite-sketch (inject a `() => DDSketch` factory for percentiles).
 
 ## Model
 
@@ -50,6 +51,41 @@ per-channel slot -- no object allocated per record, no unbounded append.
 DI alternative (cold, at attach): `hud.attach(scope, { budgets: [{channel, threshold, label?}] })`.
 Both kinds render as dashed threshold lines.
 
+## Quantile analytics (M2) -- optional PEER via injection
+
+Inject a `() => DDSketch` factory (lite-sketch >= 1.1.0); the HUD never imports it.
+
+```
+createHud(el, { stats: { quantiles: () => new DDSketch(0.01) } });
+hud.channel({ name, kind, quantiles });  // per-channel: a factory (opt IN), or false (opt OUT)
+```
+
+- What is sketched: complete + paired SPAN durations ALWAYS when a factory is
+  injected; LEVEL opt-in (per-channel `quantiles` factory, or a scope op with
+  `quantiles: true`); COUNTER / INSTANT never.
+- Zero-box hot path: the value is stored into a per-channel `Float64Array(1)` in
+  write()'s frame and fed to the peer via `addFrom(buf, 0)` (read UNBOXED inside
+  the peer), so a fractional value never boxes at the call boundary. Requires
+  lite-sketch >= 1.1.0; a factory missing `addFrom` fails closed.
+- Pre-check law (peer no-throw): the hot path rejects exactly what addFrom would
+  throw on -- NaN / negative / +-Infinity, and `v>0` outside the accepted band
+  `minIndexable < v <= maxIndexable` (EXCLUSIVE low, INCLUSIVE high) -- counts a
+  `stats().quantileDrops`, and NEVER lets addFrom throw into write(). No try/catch
+  on the hot path. `v === 0` is legal; `-0` sums as 0.
+- Bounds + strict come from the sketch GETTERS (`strict`, `minIndexable`,
+  `maxIndexable`) read ONCE, cold, at channel-sketch creation (no probe). A
+  STRICT-range DDSketch (`{ range }`, `strict === true`), a missing `addFrom`, or
+  non-finite indexable getters throw `@zakkster/lite-hud:` fail-closed -- inject a
+  default collapsing sketch.
+- Window: two sketches A/B rotated every windowSec/2 by record time (O(1) on the
+  hot path; the retiring one is clear()ed); render/inspect clear() a scratch and
+  merge() A+B into it, then quantile(). merge/clear are 0-alloc.
+- Readout: p50 / p90 / p99 / p99.9 + N tiles per sketched channel + a shaded
+  p50-p99 band behind LEVEL traces. An empty window shows "--", never 0.
+- Memory: 3 x maxBins x 8 B per sketched channel (48 KB at 2048 bins).
+- Read from code: `hud.inspect(name).quantiles` -> `{ p50, p90, p99, p999, n }`
+  (present only when the channel is sketched; `n:0` + NaN on an empty window).
+
 ## Manual channels (D4)
 
 `hud.channel({ name?, unit?, hz?, kind? })` -> `{ push(v) }`.
@@ -60,12 +96,12 @@ Synthetic stream IDs start at `0x8000` (arithmetic packed: `sid*65536 + opLow`).
 
 ```js
 import { createHud, VERSION } from '@zakkster/lite-hud';
-const hud = createHud(mountEl, { windowSec, position, hotkey, zIndex, viewport, maxDpr });
+const hud = createHud(mountEl, { windowSec, position, hotkey, zIndex, viewport, maxDpr, stats });
 hud.attach(scope, { budgets? });  // scope-driven channels
 const fps = hud.channel({ name: 'fps', kind: 0 }); fps.push(60); // manual
 hud.write(packed, t, a, b);       // direct SPP sink
-hud.stats();                      // { drops, channels, epoch, verdicts, budgets, channelStats }
-hud.inspect(name);                // { count, last: {t, a, b} } | null (cold path)
+hud.stats();                      // { drops, channels, epoch, verdicts, budgets, quantileDrops, channelStats }
+hud.inspect(name);                // { count, last: {t,a,b}, quantiles? } | null (cold path)
 hud.render();                     // draw at ~10-15Hz
 hud.show(); hud.hide(); hud.destroy();
 hud.visible; // getter
@@ -94,9 +130,11 @@ hud.visible; // getter
 ## Zero-GC (witnessed)
 
 - Zero LIBRARY-OWNED allocation: `write()` (every record kind), paired open+close,
-  pool eviction churn, and meta records are 0 B/op: `node --expose-gc test/torture.mjs`
-  (lite-leak + lite-gc-profiler; retained lane + a paired-span scavenge lane) +
-  `test/perf/PerfGate.test.mjs` (lite-perf-gate, 0 scavenges).
+  pool eviction churn, meta records, AND the analytics-ON write path (LEVEL /
+  complete SPAN / paired via addFrom) are 0 B/op: `node --expose-gc test/torture.mjs`
+  (lite-leak + lite-gc-profiler; retained lane, fractional analytics lanes, scavenge
+  lanes) + `test/perf/` (lite-perf-gate: PerfGate.test.mjs integer scenarios at 0
+  scavenges + AnalyticsBox.test.mjs fractional ON==OFF delta yardstick + controls).
 - Caveat: a DISTINCT fractional double passed as an argument is boxed by V8 at the
   JS call boundary (~16 B transient, never retained), like any JS function taking a
   double; storing a fractional magnitude into the ring costs nothing (a reused
@@ -107,6 +145,6 @@ hud.visible; // getter
 ## Conventions
 
 - ASCII-only source. No console.log/debugger in shipped code.
-- `node:test` suite (80 tests). Run: `node --test test/Hud.test.js` or `npm test`.
+- `node:test` suite (112 tests). Run: `node --test test/Hud.test.js` or `npm test`.
 - Gates: `npm run torture` / `torture:controls` / `test:perf` / `verify`.
 - sideEffects: false. MIT. Copyright Zahary Shinikchiev.

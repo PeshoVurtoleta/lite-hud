@@ -23,6 +23,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
+import { DDSketch } from '@zakkster/lite-sketch';
 import { createHud } from '../../Hud.js';
 
 const WIN = 5; // default windowSec
@@ -54,7 +55,7 @@ function makeScope() {
     return {
         streams() {
             return [
-                { id: 1, name: 'lvl', hz: 60, ops: [{ code: OP_LEVEL, name: 'lvl', kind: 0, width: 1 }] },
+                { id: 1, name: 'lvl', hz: 60, ops: [{ code: OP_LEVEL, name: 'lvl', kind: 0, width: 1, quantiles: true }] },
                 { id: 2, name: 'inst', ops: [{ code: OP_INSTANT, name: 'inst', kind: 1, width: 1 }] },
                 { id: 3, name: 'ctr', ops: [{ code: OP_COUNTER, name: 'ctr', kind: 3, width: 1 }] },
                 { id: 4, name: 'wide', ops: [{ code: OP_WIDE, name: 'wide', kind: 0, width: 3 }] },
@@ -92,6 +93,15 @@ const GROWS =
 
 function newHud() {
     const hud = createHud(null);
+    hud.attach(makeScope());
+    return hud;
+}
+// analytics-ON HUD: the injected `() => DDSketch` factory wires DDSketch.add into
+// the write path (SPAN always + the opted-in LEVEL op). The sketch backing arrays
+// are allocated ONCE at attach, so `grows` is still a 0-delta counter.
+const mkSketch = () => new DDSketch(0.01);
+function newHudQ() {
+    const hud = createHud(null, { stats: { quantiles: mkSketch } });
     hud.attach(makeScope());
     return hud;
 }
@@ -240,6 +250,56 @@ const fractionalConst = {
 // 0 RETAINED B/op by test/torture.mjs, the appropriate lane for a transient.
 
 // ===========================================================================
+// analytics-ON scenarios -- DDSketch wired into the write path via the zero-box
+// addFrom(buf, i) entry point (the HUD stores the value into a Float64Array in
+// write()'s own frame and never passes it as an argument). Integer inputs stay at
+// 0 scavenges on this maxScavenges:0 lane, for all three kinds INCLUDING paired
+// (the fractional-input ON==OFF-baseline delta yardstick lives in
+// AnalyticsBox.test.mjs, where OFF and ON can be compared directly).
+// ===========================================================================
+
+const analyticsLevel = {
+    name: 'analytics LEVEL write (opted-in sketch, addFrom)',
+    setup() { return { hud: newHudQ(), v: 0 }; },
+    hot(s, n) {
+        const hud = s.hud;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) { v = (v + 1) | 0; hud.write(packed(1, OP_LEVEL), v, v & 63, 0); }
+        s.v = v | 0;
+    },
+    statsOf() { return growsOf(); },
+};
+
+const analyticsComplete = {
+    name: 'analytics complete SPAN write (addFrom)',
+    setup() { return { hud: newHudQ(), v: 0 }; },
+    hot(s, n) {
+        const hud = s.hud;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) { v = (v + 1) | 0; hud.write(packed(5, OP_SPAN), v, (v & 63) + 1, 0); }
+        s.v = v | 0;
+    },
+    statsOf() { return growsOf(); },
+};
+
+const analyticsPaired = {
+    name: 'analytics paired open+close (duration sketch, addFrom)',
+    setup() { return { hud: newHudQ(), v: 0 }; },
+    hot(s, n) {
+        const hud = s.hud;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 1) | 0;
+            const k = v & 63;
+            hud.write(packed(6, OP_OPEN), v, k, 0);
+            hud.write(packed(6, OP_CLOSE), v + 3, k, 0); // duration 3 (SMI via addFrom)
+        }
+        s.v = v | 0;
+    },
+    statsOf() { return growsOf(); },
+};
+
+// ===========================================================================
 // mustFail control -- a per-op fresh object retained in an array. MUST trip the
 // gate (scavenges scale with n), proving the instrument has teeth.
 // ===========================================================================
@@ -257,6 +317,41 @@ const mustFailAlloc = {
             sink.push({ v }); // fresh object per op -> heap churn
             if (sink.length > 8192) sink.length = 0;
         }
+        s.v = v | 0;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+// mustFail (analytics): an injected factory whose addFrom() allocates per op (the
+// HUD's hot path calls addFrom, not add). The HUD's pre-check + rotate add
+// nothing, but this peer churns the young gen, so the analytics write path MUST
+// trip the gate -- proving a bad injected sketch cannot slip a hidden allocation
+// past the instrument. It carries the N1 getters so enableSketch accepts it.
+const allocSink = [];
+const allocFactory = () => {
+    const d = new DDSketch(0.01);
+    return {
+        addFrom(buf, i) { allocSink.push({ v: buf[i] }); if (allocSink.length > 8192) allocSink.length = 0; return d.addFrom(buf, i); },
+        quantile(q) { return d.quantile(q); },
+        merge(o) { return d; },
+        clear() { return d.clear(); },
+        get strict() { return d.strict; },
+        get minIndexable() { return d.minIndexable; },
+        get maxIndexable() { return d.maxIndexable; },
+        get count() { return d.count; },
+    };
+};
+const mustFailAnalytics = {
+    name: 'injected sketch whose add() allocates (MUST allocate)',
+    setup() {
+        const hud = createHud(null, { stats: { quantiles: allocFactory } });
+        hud.attach(makeScope());
+        return { hud, v: 0 };
+    },
+    hot(s, n) {
+        const hud = s.hud;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) { v = (v + 1) | 0; hud.write(packed(5, OP_SPAN), v, (v & 63) + 1, 0); }
         s.v = v | 0;
     },
     statsOf() { return { grows: 0 }; },
@@ -280,6 +375,9 @@ zgcSuite({
         pairedEvictionChurn,
         metaBudgetSet,
         fractionalConst,
+        analyticsLevel,
+        analyticsComplete,
+        analyticsPaired,
     ],
-    mustFail: [mustFailAlloc],
+    mustFail: [mustFailAlloc, mustFailAnalytics],
 });

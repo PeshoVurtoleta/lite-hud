@@ -1,5 +1,100 @@
 # @zakkster/lite-hud -- Changelog
 
+## 2.2.0 (2026-09-23) -- DDSketch percentiles (optional peer)
+
+Additive; the v2.1.0 API is a strict subset. With no factory injected, behavior,
+`stats()` (except the additive `quantileDrops`, always 0), and the render call
+trace are byte-identical to 2.1.0 (gated by the degrade tests).
+
+Requires `@zakkster/lite-sketch` >= 1.1.0 when analytics is injected (for the
+zero-box `DDSketch.addFrom` + the N1 getters). Optional peer -- with none
+installed the package is unchanged.
+
+### Added
+
+- **`stats.quantiles` option (optional peer).** Inject a `() => DDSketch` factory
+  (`@zakkster/lite-sketch` >= 1.1.0) for per-channel p50 / p90 / p99 / p99.9
+  readouts + a shaded p50-p99 band behind LEVEL traces. The HUD never imports
+  lite-sketch. A per-channel override `hud.channel({ quantiles })` takes a factory
+  (opt IN; SPAN or LEVEL) or `false` (opt OUT); a scope LEVEL op opts in with
+  `quantiles: true`. Complete + paired SPAN durations are sketched automatically;
+  LEVEL is opt-in; COUNTER / INSTANT never. Declared as an OPTIONAL `peerDependency`.
+- **`stats().quantileDrops`** -- sum of per-channel values rejected by the
+  analytics pre-check (never reached the sketch). Separate from `drops`. The key is
+  ALWAYS PRESENT (0 when no factory is injected), so `stats()` has a stable shape.
+- **`inspect(name).quantiles`** -- `{ p50, p90, p99, p999, n }` for a sketched
+  channel (present only when analytics is on; `n:0` + NaN on an empty window).
+
+### Changed
+
+- `package.json`: `@zakkster/lite-sketch` ^1.1.0 added as a devDependency and an
+  OPTIONAL peerDependency (`peerDependenciesMeta.optional`). Zero runtime deps.
+- `Hud.d.ts` (additive): `QuantileSketch` (requires `addFrom`, `quantile`, `merge`,
+  `clear`, `count`, `strict`, `minIndexable`, `maxIndexable`), `QuantileFactory`,
+  `HudStatsOptions`, `QuantileReadout`; `HudOptions.stats`; `quantiles` on
+  `ChannelDescriptor` / `StreamOpDescriptor`; `quantileDrops`; optional
+  `inspect().quantiles`.
+- `npm run test:perf` runs the whole `test/perf/` directory (adds
+  `AnalyticsBox.test.mjs`).
+- Tests: 86 -> 112 node:tests.
+
+### Fixed
+
+- **`render()` survives a reentrant `destroy()`.** A `destroy()` called from inside
+  a draw call during `render()` (e.g. from a patched `ctx.fillText`) used to null
+  the closure context mid-frame and throw `TypeError: Cannot set properties of null`.
+  `render()` now takes a per-frame LOCAL snapshot of the context and draws only
+  through it, so a mid-frame `destroy()` lets the frame finish harmlessly on the
+  detached context and the next `render()` is a no-op. Pre-existing (render read the
+  closure context directly); M2's percentile-tile `fillText` calls just widened the
+  window. No hot-path change (render is the cold path).
+
+### Design
+
+- **Zero-box hot path (`addFrom`).** The value is written into a per-channel
+  `Float64Array(1)` in `write()`'s own frame and fed to the peer via
+  `DDSketch.addFrom(buf, 0)`, which reads it UNBOXED -- so a FRACTIONAL value never
+  boxes at the call boundary (passing it as an `add(value)` argument would box a
+  ~16 B transient when the call is not inlined). Requires lite-sketch >= 1.1.0; a
+  factory missing `addFrom` fails closed.
+- **Peer no-throw pre-check.** `addFrom` throws on NaN / negative / +-Infinity /
+  out-of-range. The hot path rejects exactly that set -- plus `v>0` outside the
+  accepted band `minIndexable < v <= maxIndexable` (EXCLUSIVE low, INCLUSIVE high)
+  -- counting a `quantileDrops`, so the peer never throws into `write()`; there is
+  NO try/catch on the hot path. `v === 0` is legal; `-0` sums as 0.
+- **Getter-based validation (no probe).** The bounds and the strict check come from
+  the sketch's own getters (`strict`, `minIndexable`, `maxIndexable`), read ONCE,
+  cold, when the channel sketch is created. A strict-range DDSketch (`strict ===
+  true`), a missing `addFrom`, or non-finite indexable getters throw
+  `@zakkster/lite-hud:` fail-closed. The sketch must report `strict === false`
+  explicitly; a missing `strict` getter fails closed.
+- **Window.** Two sketches A/B rotate every windowSec/2 by record time (O(1) on
+  the hot path; the retiring one is `clear()`ed); render/inspect `clear()` a
+  scratch and `merge()` A+B into it, then `quantile()`. `merge`/`clear` are 0-alloc.
+- **Memory.** 3 x maxBins x 8 B per sketched channel (48 KB at 2048 bins); window
+  coverage is windowSec/2 .. windowSec.
+
+### Proof
+
+- Suite: 112 node:tests (0 failures); perf 17/17; torture ok; break control exits 1.
+- Oracle: p50/p90/p99/p99.9 within alpha (0.01) of a sorted-Float64Array oracle on
+  uniform / lognormal / pareto streams over one rotation boundary; empty -> "--".
+  Pre-check boundaries verified against the peer's exact accept/reject at both edges.
+- Torture (`node --expose-gc test/torture.mjs`): the analytics-ON write path
+  (paired + complete SPAN + opted-in LEVEL + `channel().push()`) is 0 RETAINED B/op
+  with FRACTIONAL inputs, gc major 0 / minor 0, leak size 0 over 4096
+  create/attach/feed cycles, arrayBuffers delta <= 0 over 64 cycles. Control: an
+  injected `addFrom` per-op closure trips the gate (non-zero exit).
+- Perf gate: analytics-ON LEVEL / complete-SPAN / PAIRED integer scenarios at 0
+  scavenges (4 MB semi-space) + a mustFail (an injected sketch whose `addFrom`
+  allocates) is caught. `AnalyticsBox.test.mjs` drives the FRACTIONAL yardstick:
+  analytics-ON minor-GC scaling == analytics-OFF scaling (delta ~0). Measured (8N,
+  minorLo->minorHi): paired OFF 4->24 / ON 4->24; complete OFF 4->24 / ON 3->24;
+  LEVEL OFF 3->24 / ON 3->24. `addFrom` removes the paired-duration box exactly:
+  on the same Node (26.8.2), passing the same unboxed value as `add(qv)` scales to
+  36 for paired / complete / LEVEL. A teeth control (an
+  injected sketch whose `addFrom` allocates per op) scales well above the baseline.
+
 ## 2.1.0 (2026-09-23) -- technical health: witnessed zero-GC + DPR-correct rendering
 
 Additive; the v2.0.0 API is a strict subset. No data-model change.

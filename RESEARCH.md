@@ -226,6 +226,8 @@ a HOT-SPOTS panel (SpaceSaving top-k) that reorders live. The demo: a synthetic 
 injected latency spike + a regime change -- the p99 tile jumps, the band fattens, the hot-spots
 panel reshuffles, and (post lite-adaptive) a drift marker drops. The suite's tools made visible on
 their own profiler. Repo-only, zero-GC frame path (the lite-o1 / lite-sketch demo law).
+PLANNED as milestone D (ROADMAP.md section 7): a DEMO.md blueprint first, then the LiteSketch
+demo tier (kernels.mjs + serve.mjs + Demo.test.mjs honesty gate), after v3.0.
 
 ---
 
@@ -382,3 +384,17 @@ one `mustFail` control that allocates per op. Script:
   M1 declares only lite-viewport.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com> -- never "Karadjov".
+
+## 13. M2 finding: fractional-argument boxing at the peer boundary (2026-09-23)
+
+Measured by the M2 reviewer (zgcSuite scaling lane, 4 MB semi-space, fractional inputs): passing a
+library-computed fractional duration to `DDSketch.add(value)` allocates a ~16 B HeapNumber per call
+whenever the call site does not inline. That is the normal state for a cross-module, polymorphic
+consumer. paired 43 vs a 24 analytics-OFF baseline (complete/LEVEL: no
+delta; their value is the caller's already-boxed argument). It is invisible to measureAllocs (transient)
+and to SMI-valued test inputs. Lesson for every later peer milestone (M3-M5): any DI peer method
+that takes a DOUBLE argument on the hot path must be driven with fractional values in the scaling
+lane. Integer-weighted peers (SpaceSaving weights, HLL/CMS integer keys) pass Smis and are not
+affected. Remedy chosen: a buffer-read entry point on the peer (`DDSketch.addFrom(buf, i)`,
+lite-sketch 1.1.0); see ROADMAP.md section 6.1.
+

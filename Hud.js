@@ -1,4 +1,4 @@
-// @zakkster/lite-hud 2.1.0
+// @zakkster/lite-hud 2.2.0
 // SPP-native zero-GC canvas overlay. Channels from scope registry, trigger
 // cursors from gate verdicts and budget lines, legend with per-channel
 // visibility toggle. Drop-in stats.js replacement via hud.channel().
@@ -6,7 +6,7 @@
 // Copyright (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com>
 // MIT License
 
-export const VERSION = '2.1.0';
+export const VERSION = '2.2.0';
 
 // ---------------------------------------------------------------------------
 // SPP v1 protocol constants -- inlined, never imported
@@ -180,6 +180,101 @@ function poolEvictOldest(ch) {
 }
 
 // ---------------------------------------------------------------------------
+// DDSketch quantile analytics (M2) -- optional PEER via dependency injection.
+// The HUD never imports lite-sketch; a consumer injects a `() => DDSketch`
+// factory (createHud stats.quantiles, or a per-channel hud.channel override).
+// On the hot path the HUD pre-validates the value (peer no-throw law: reject
+// exactly what DDSketch.add would reject) and calls add() -- 0 B/op; on render
+// (cold) it merges the two window sketches into a scratch and reads quantile().
+// ---------------------------------------------------------------------------
+
+const HUD_PREFIX = '@zakkster/lite-hud: ';
+
+// Cold: wire a channel for quantile analytics. The factory must return a
+// DDSketch-like sketch exposing the ZERO-BOX `addFrom(buf, i)` entry point (the
+// HUD's hot path never uses `add(value)` -- a fractional argument boxes) plus the
+// N1 getters (`strict`, `minIndexable`, `maxIndexable`). Fail closed on a missing
+// method, a strict-range sketch, or non-finite indexable bounds (null is not
+// zero). Allocates the A/B rotating window pair, the render scratch, and the
+// length-1 value buffer -- ALL allocation is here (attach/channel time); the write
+// path never allocates.
+function enableSketch(ch, factory, halfMs) {
+    const s = factory();
+    if (!s || typeof s.addFrom !== 'function' || typeof s.quantile !== 'function' ||
+        typeof s.merge !== 'function' || typeof s.clear !== 'function') {
+        throw new Error(HUD_PREFIX + 'stats.quantiles factory must return a ' +
+            'DDSketch-like sketch with addFrom/quantile/merge/clear, got ' +
+            (s === null ? 'null' : typeof s));
+    }
+    // Require an EXPLICIT non-strict sketch: a strict fixed-range sketch throws on
+    // out-of-range values, and a missing/undefined `strict` getter is an unverified
+    // state -- both fail closed (the HUD needs a collapsing sketch that folds
+    // out-of-range values instead of throwing).
+    if (s.strict !== false) {
+        throw new Error(HUD_PREFIX + 'stats.quantiles factory must return a ' +
+            'non-strict (collapsing) DDSketch with strict === false; got strict === ' +
+            String(s.strict) + ' (a strict-range sketch throws on out-of-range values; ' +
+            'drop the `range` option).');
+    }
+    // Indexable bounds drive the hot-path pre-check. Fail closed if the getters
+    // are missing or non-finite (an unverified bound is not a usable bound).
+    const lo = s.minIndexable, hi = s.maxIndexable;
+    if (typeof lo !== 'number' || typeof hi !== 'number' || lo !== lo || hi !== hi ||
+        lo === Infinity || lo === -Infinity || hi === Infinity || hi === -Infinity ||
+        !(lo < hi)) {
+        throw new Error(HUD_PREFIX + 'stats.quantiles factory sketch has invalid ' +
+            'indexable bounds (minIndexable/maxIndexable must be finite with ' +
+            'min < max), got ' + String(lo) + ' .. ' + String(hi));
+    }
+    ch.lo = lo;                 // EXCLUSIVE low floor: add accepts lo < v <= hi
+    ch.hi = hi;                 // INCLUSIVE high ceiling
+    ch.qA = s;                  // reuse the validated instance as window sketch A
+    ch.qB = factory();
+    ch.qScratch = factory();
+    ch.qBuf = new Float64Array(1);
+    ch.q = ch.qA;
+    ch.qHalf = halfMs;
+    ch.qRotAt = 0;
+}
+
+// Window rotation by record time (fires at most once per windowSec/2, not per
+// record): retire the stale (inactive) sketch, clear it, make it active. A gap
+// wider than one half clears BOTH so no stale mass survives. clear() is 0-alloc.
+function qRotate(ch, t) {
+    let other = ch.q === ch.qA ? ch.qB : ch.qA;
+    other.clear();
+    ch.q = other;
+    ch.qRotAt += ch.qHalf;
+    if (t >= ch.qRotAt) {
+        other = ch.q === ch.qA ? ch.qB : ch.qA;
+        other.clear();
+        ch.q = other;
+        ch.qRotAt = t + ch.qHalf;
+    }
+}
+
+// NOTE: the hot analytics step is INLINED at the two write() call sites (the
+// paired-close arm and the width=1 tail) rather than a helper, so neither the
+// fractional value nor the record time `t` ever crosses an extra JS call boundary
+// as an argument (which V8 boxes when the call is not inlined). The value is
+// written into ch.qBuf in write()'s own frame and read back UNBOXED; the peer is
+// fed through the zero-box addFrom(buf, 0). Only qRotate (cold, fires at most once
+// per windowSec/2) takes `t` as an argument, and its rare box is amortized to ~0.
+// The pre-check rejects exactly what addFrom rejects (NaN / negative / +-Infinity,
+// and v>0 outside the accepted band `lo < v <= hi`); v === 0 is legal (-0 -> 0).
+
+// Cold: compact quantile tile formatter (render only, never a hot path).
+function qFmt(v) {
+    if (v !== v) return '--';
+    if (v === 0) return '0';
+    const a = v < 0 ? -v : v;
+    if (a >= 1000) return v.toFixed(0);
+    if (a >= 1) return v.toFixed(1);
+    if (a >= 0.001) return v.toFixed(3);
+    return v.toExponential(1);
+}
+
+// ---------------------------------------------------------------------------
 // Ring helpers -- hot path, zero-alloc
 // ---------------------------------------------------------------------------
 
@@ -238,6 +333,21 @@ function makeChannel(idx, sid, name, unit, hz, kind, width, winSec) {
         metaBudgetActive: false,
         metaBudgetThreshold: 0,
         metaBudgetLabel: '',
+        // DDSketch quantile analytics (M2). Set by enableSketch (cold) when a
+        // factory is injected -- for a SPAN channel (always) or an opted-in
+        // LEVEL channel; null on every other channel (monomorphic shape, so the
+        // hot `ch.q !== null` gate is a stable shape check). qAdd (hot) reads
+        // q/lo/hi/qRotAt; render + inspect (cold) merge qA+qB into qScratch.
+        q: null,
+        qA: null,
+        qB: null,
+        qScratch: null,
+        qBuf: null,
+        qHalf: 0,
+        qRotAt: 0,
+        qDrops: 0,
+        lo: 0,
+        hi: 0,
         // Precomputed hit zones for legend click detection (set in render)
         hitY0: 0,
         hitY1: 0,
@@ -329,6 +439,20 @@ export function createHud(mountEl, opts) {
             '@zakkster/lite-hud: maxDpr must be a finite number >= 1 or Infinity, got ' +
             String(o.maxDpr));
     }
+    // stats: an optional analytics-factory bag (M2 uses stats.quantiles, a
+    // `() => DDSketch` factory). Validated typeof-first, fail closed. The HUD
+    // never imports lite-sketch; it only calls the injected instance's methods.
+    const _stats = o.stats;
+    if (_stats !== undefined && (_stats === null || typeof _stats !== 'object')) {
+        throw new Error(HUD_PREFIX + 'stats must be an object, got ' +
+            (_stats === null ? 'null' : typeof _stats));
+    }
+    const _qFactory = (_stats && _stats.quantiles !== undefined) ? _stats.quantiles : null;
+    if (_qFactory !== null && typeof _qFactory !== 'function') {
+        throw new Error(HUD_PREFIX + 'stats.quantiles must be a () => DDSketch ' +
+            'factory function, got ' + typeof _qFactory);
+    }
+    const _qHalfMs = winSec * 1000 / 2;
 
     // -- State ------------------------------------------------------------------
     const channels = [];
@@ -355,7 +479,11 @@ export function createHud(mountEl, opts) {
     let _visible = true;
     // Canvas refs
     let canvas = null;
-    let ctx = null;
+    // Closure-held 2D context. render() takes a per-frame LOCAL snapshot of this
+    // (`const ctx = _ctx`) before drawing, so a reentrant destroy() invoked from
+    // inside a draw call (which nulls _ctx mid-frame) lets the current frame finish
+    // harmlessly on the detached context instead of throwing on a null.
+    let _ctx = null;
     let dpr = 1;
     // Injected viewport instance + its HUD-owned wrapper div (peer render path)
     let vp = null;
@@ -466,6 +594,21 @@ export function createHud(mountEl, opts) {
                     const tOpen = ch.poolTOpen[slot];
                     poolDelete(ch, slot);
                     ringWrite(ch, tOpen, t, k); // [t_open, t_close, correlId]
+                    // Inlined analytics: store the (fractional) duration into the
+                    // channel scratch in THIS frame (no argument box), read it back
+                    // unboxed, pre-check, then feed the peer via zero-box addFrom.
+                    if (ch.q !== null) {
+                        const buf = ch.qBuf;
+                        buf[0] = t - tOpen;
+                        const qv = buf[0];
+                        if (qv !== qv || qv < 0 || qv === Infinity ||
+                            (qv > 0 && (qv <= ch.lo || qv > ch.hi))) {
+                            ch.qDrops++;
+                        } else {
+                            if (t >= ch.qRotAt) qRotate(ch, t);
+                            ch.q.addFrom(buf, 0);
+                        }
+                    }
                 }
                 // close without matching open: silently skip (open may have been evicted)
             }
@@ -490,6 +633,22 @@ export function createHud(mountEl, opts) {
 
         // Standard width=1 record
         ringWrite(ch, t, a, b);
+        // Inlined analytics: complete SPAN duration (a) always, or an opted-in
+        // LEVEL value (a). INSTANT / COUNTER keep ch.q === null (no-op). `a` is the
+        // write() argument; store it into the scratch in this frame and feed the
+        // peer via zero-box addFrom (no extra argument box).
+        if (ch.q !== null) {
+            const buf = ch.qBuf;
+            buf[0] = a;
+            const qv = buf[0];
+            if (qv !== qv || qv < 0 || qv === Infinity ||
+                (qv > 0 && (qv <= ch.lo || qv > ch.hi))) {
+                ch.qDrops++;
+            } else {
+                if (t >= ch.qRotAt) qRotate(ch, t);
+                ch.q.addFrom(buf, 0);
+            }
+        }
     }
 
     // -- metaWrite() -- cold meta-stream handler, off the write() hot body -------
@@ -558,6 +717,15 @@ export function createHud(mountEl, opts) {
                 channels.push(ch);
                 registerOp(sd.id, op.code & 0xFF, ch.idx, 'only');
                 if (w > 1) allocPending(sd.id, 3 * w);
+                // Quantile analytics (cold): a complete SPAN is sketched whenever
+                // a factory is injected; a LEVEL channel only when the op opts in
+                // (op.quantiles: true -> the default factory, or its own factory).
+                if (op.kind === KIND_SPAN && _qFactory) {
+                    enableSketch(ch, _qFactory, _qHalfMs);
+                } else if (op.kind === KIND_LEVEL && op.quantiles) {
+                    const f = typeof op.quantiles === 'function' ? op.quantiles : _qFactory;
+                    if (f) enableSketch(ch, f, _qHalfMs);
+                }
             }
 
             // Paired SPAN: consecutive pairs (protocol ordering: open first, close second)
@@ -576,6 +744,8 @@ export function createHud(mountEl, opts) {
                 channels.push(ch);
                 registerOp(sd.id, ch.openOpLow, ch.idx, 'open');
                 registerOp(sd.id, ch.closeOpLow, ch.idx, 'close');
+                // Paired SPAN durations are sketched whenever a factory is injected.
+                if (_qFactory) enableSketch(ch, _qFactory, _qHalfMs);
             }
         }
 
@@ -602,6 +772,15 @@ export function createHud(mountEl, opts) {
 
     function channel(desc) {
         const kind = desc.kind !== undefined ? desc.kind : KIND_LEVEL;
+        // Per-channel quantile override: a `() => DDSketch` factory (opt IN; LEVEL
+        // or SPAN), or false (opt OUT). Undefined inherits the createHud default,
+        // which auto-enables SPAN only -- LEVEL analytics are always opt-in.
+        const qOverride = desc.quantiles;
+        if (qOverride !== undefined && qOverride !== false &&
+            typeof qOverride !== 'function') {
+            throw new Error(HUD_PREFIX + 'channel quantiles must be a factory ' +
+                'function or false, got ' + typeof qOverride);
+        }
         const sid = synthId++;
         const opLow = 0x00;
         const ch = makeChannel(
@@ -612,6 +791,19 @@ export function createHud(mountEl, opts) {
         channels.push(ch);
         if (!lut[sid]) lut[sid] = [];
         lut[sid][opLow] = {chIdx: ch.idx, role: 'only'};
+
+        // Resolve + enable analytics (cold). An explicit factory works on SPAN or
+        // LEVEL; a factory on INSTANT / COUNTER is a misuse -> fail closed.
+        let fac = null;
+        if (typeof qOverride === 'function') fac = qOverride;
+        else if (qOverride === undefined && kind === KIND_SPAN) fac = _qFactory;
+        if (fac) {
+            if (kind !== KIND_SPAN && kind !== KIND_LEVEL) {
+                throw new Error(HUD_PREFIX + 'quantiles apply only to SPAN or ' +
+                    'LEVEL channels, not kind ' + kind);
+            }
+            enableSketch(ch, fac, _qHalfMs);
+        }
 
         // Arithmetic packed -- avoids signed-Int32 overflow for sid >= 0x8000.
         const packed = sid * 65536 + opLow;
@@ -636,10 +828,12 @@ export function createHud(mountEl, opts) {
 
     function stats() {
         let totalBudgets = 0;
+        let quantileDrops = 0;
         const channelStats = new Array(channels.length);
         for (let ci = 0; ci < channels.length; ci++) {
             totalBudgets += channels[ci].budgets.length +
                 (channels[ci].metaBudgetActive ? 1 : 0);
+            quantileDrops += channels[ci].qDrops;
             channelStats[ci] = {name: channels[ci].name, count: channels[ci].count, head: channels[ci].head};
         }
         return {
@@ -648,6 +842,10 @@ export function createHud(mountEl, opts) {
             epoch,
             verdicts: verdictCount < VCAP ? verdictCount : VCAP,
             budgets: totalBudgets,
+            // Sum of per-channel values rejected by the analytics pre-check (never
+            // reached DDSketch.add). Separate from `drops` (demux rejections);
+            // always 0 with no factory injected.
+            quantileDrops,
             channelStats,
         };
     }
@@ -663,7 +861,23 @@ export function createHud(mountEl, opts) {
         }
         if (!ch || ch.count === 0) return null;
         const rec = ringRead(ch, ringLen(ch) - 1);
-        return {count: ch.count, last: {t: rec[0], a: rec[1], b: rec[2]}};
+        const out = {count: ch.count, last: {t: rec[0], a: rec[1], b: rec[2]}};
+        // Windowed quantile readout for a sketched channel (cold: merge qA+qB into
+        // the scratch, then walk). Present only when analytics is on; an empty
+        // window reports n:0 with NaN quantiles ("--" on the overlay, never 0).
+        if (ch.q !== null) {
+            const s = ch.qScratch;
+            s.clear();
+            s.merge(ch.qA);
+            s.merge(ch.qB);
+            out.quantiles = s.count === 0
+                ? {p50: NaN, p90: NaN, p99: NaN, p999: NaN, n: 0}
+                : {
+                    p50: s.quantile(0.5), p90: s.quantile(0.9),
+                    p99: s.quantile(0.99), p999: s.quantile(0.999), n: s.count,
+                };
+        }
+        return out;
     }
 
     // -- Canvas overlay ---------------------------------------------------------
@@ -733,7 +947,7 @@ export function createHud(mountEl, opts) {
                     maxDpr: _maxDpr,
                     onResize: onVpResize,
                 });
-                ctx = vp.ctx;
+                _ctx = vp.ctx;
                 dpr = vp.dpr;
             } catch (err) {
                 if (vp && typeof vp.destroy === 'function') {
@@ -743,7 +957,7 @@ export function createHud(mountEl, opts) {
                 wrapper = null;
                 vp = null;
                 canvas = null;
-                ctx = null;
+                _ctx = null;
                 throw err;
             }
             // Only after the fallible construction succeeds do we attach the
@@ -770,7 +984,7 @@ export function createHud(mountEl, opts) {
     // Viewport onResize callback: pick up the new dpr/ctx and redraw. render()
     // no-ops until ctx is wired (the constructor's initial resize fires early).
     function onVpResize() {
-        if (vp) { dpr = vp.dpr; ctx = vp.ctx; }
+        if (vp) { dpr = vp.dpr; _ctx = vp.ctx; }
         render();
     }
 
@@ -785,17 +999,17 @@ export function createHud(mountEl, opts) {
         canvas.height = tot * dpr;
         canvas.style.width = HUD_W + 'px';
         canvas.style.height = tot + 'px';
-        ctx = canvas.getContext('2d');
-        if (ctx) {
-            ctx.setTransform(1, 0, 0, 1, 0, 0);
-            ctx.scale(dpr, dpr);
+        _ctx = canvas.getContext('2d');
+        if (_ctx) {
+            _ctx.setTransform(1, 0, 0, 1, 0, 0);
+            _ctx.scale(dpr, dpr);
         }
     }
 
     // -- render() -- cold path, caller-throttled --------------------------------
 
     function render() {
-        if (!canvas || !ctx || !_visible) return;
+        if (!canvas || _ctx === null || !_visible) return;
 
         const now = nowMs();
         const tMin = now - winSec * 1000;
@@ -817,6 +1031,16 @@ export function createHud(mountEl, opts) {
             if (canvas.height / dpr < neededH) resize();
         }
         const H = canvas.height / dpr;
+
+        // Per-frame LOCAL snapshot of the context. Everything below (and the nested
+        // render closures) draws through `ctx`, never the closure `_ctx`. resize() /
+        // vp.resize() above may reassign _ctx; after this point a reentrant
+        // destroy() -- e.g. from a patched ctx.fillText -- nulls _ctx but not this
+        // local, so the frame finishes harmlessly on the detached context and the
+        // next render() bails at the guard. (canvas / vp / wrapper are read only in
+        // the resize block above, before any draw call, so they need no snapshot.)
+        const ctx = _ctx;
+        if (ctx === null) return;
 
         // Background
         ctx.fillStyle = C_BG;
@@ -844,6 +1068,34 @@ export function createHud(mountEl, opts) {
 
         function xOf(t) {
             return LBL_W + PAD + ((t - tMin) / (tMax - tMin)) * cw;
+        }
+
+        // Merge the two rotating window sketches into the render scratch (cold,
+        // 0-alloc merge/clear) and return it. Caller checks scratch.count.
+        function qWindow(ch) {
+            const s = ch.qScratch;
+            s.clear();
+            s.merge(ch.qA);
+            s.merge(ch.qB);
+            return s;
+        }
+
+        // Compact p50/p90/p99/p99.9 tile line at the row foot. Empty window shows
+        // "--" (never 0). Cold path (render is caller-throttled).
+        function drawQTiles(s, rowY) {
+            ctx.font = '7px monospace';
+            ctx.textAlign = 'right';
+            if (s.count === 0) {
+                ctx.fillStyle = C_DIM;
+                ctx.fillText('p50 -- p90 -- p99 -- p99.9 --', W - PAD, rowY + ROW_H - 3);
+            } else {
+                ctx.fillStyle = C_TEXT;
+                ctx.fillText(
+                    'p50 ' + qFmt(s.quantile(0.5)) + ' p90 ' + qFmt(s.quantile(0.9)) +
+                    ' p99 ' + qFmt(s.quantile(0.99)) + ' p99.9 ' + qFmt(s.quantile(0.999)),
+                    W - PAD, rowY + ROW_H - 3);
+            }
+            ctx.textAlign = 'left';
         }
 
         for (let ci = 0; ci < channels.length; ci++) {
@@ -929,6 +1181,20 @@ export function createHud(mountEl, opts) {
                 }
                 ctx.setLineDash([]);
 
+                // Shaded p50-p99 band behind the trace (opted-in LEVEL only).
+                let qs = null;
+                if (ch.q !== null) {
+                    qs = qWindow(ch);
+                    if (qs.count > 0) {
+                        const yA = yOf(qs.quantile(0.5));
+                        const yB = yOf(qs.quantile(0.99));
+                        const top = yA < yB ? yA : yB;
+                        const h = (yA > yB ? yA - yB : yB - yA) || 1;
+                        ctx.fillStyle = C_SPAN_OPE;
+                        ctx.fillRect(LBL_W + PAD, top, cw, h);
+                    }
+                }
+
                 const drawPath = (isStep) => {
                     let first = true;
                     let prevY = 0;
@@ -974,6 +1240,9 @@ export function createHud(mountEl, opts) {
                 ctx.textAlign = 'right';
                 ctx.fillText(lastVal.toFixed(1), W - PAD, midY + 4);
                 ctx.textAlign = 'left';
+
+                // Percentile tiles (opted-in LEVEL). qs was merged for the band.
+                if (qs !== null) drawQTiles(qs, rowY);
 
             } else if (ch.kind === KIND_INSTANT) {
                 const tail = ch.count >= ch.cap ? ch.head : 0;
@@ -1032,6 +1301,8 @@ export function createHud(mountEl, opts) {
                         ctx.fillRect(x0, rowY + 6, W - PAD - x0, ROW_H - 12);
                     }
                 }
+                // Percentile tiles for a sketched SPAN channel (duration p50..p99.9).
+                if (ch.q !== null) drawQTiles(qWindow(ch), rowY);
             }
 
             ctx.restore();
@@ -1117,7 +1388,7 @@ export function createHud(mountEl, opts) {
             if (wrapper) { wrapper.remove(); wrapper = null; }
             else canvas.remove();
             canvas = null;
-            ctx = null;
+            _ctx = null;
         }
         if (hotkey && typeof document !== 'undefined') {
             document.removeEventListener('keydown', onKey);

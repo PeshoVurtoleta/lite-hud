@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-hud",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "SPP-native zero-GC canvas overlay for the @zakkster profiler suite.",
   "type": "module",
   "main": "./Hud.js",
@@ -27,19 +27,24 @@
     "test": "node --test test/Hud.test.js",
     "torture": "node --expose-gc test/torture.mjs",
     "torture:controls": "node test/controls.mjs",
-    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/",
     "verify": "npm test && npm run torture && npm run torture:controls && npm run test:perf"
   },
   "devDependencies": {
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
     "@zakkster/lite-perf-gate": "^1.4.2",
+    "@zakkster/lite-sketch": "^1.1.0",
     "@zakkster/lite-viewport": "^1.1.0"
   },
   "peerDependencies": {
+    "@zakkster/lite-sketch": "^1.1.0",
     "@zakkster/lite-viewport": "^1.1.0"
   },
   "peerDependenciesMeta": {
+    "@zakkster/lite-sketch": {
+      "optional": true
+    },
     "@zakkster/lite-viewport": {
       "optional": true
     }

@@ -43,7 +43,7 @@ async function main() {
             'torture: FAIL -- run with --expose-gc: node --expose-gc test/torture.mjs\n');
         process.exit(1);
     }
-    for (const pkg of ['@zakkster/lite-gc-profiler', '@zakkster/lite-leak']) {
+    for (const pkg of ['@zakkster/lite-gc-profiler', '@zakkster/lite-leak', '@zakkster/lite-sketch']) {
         try {
             await import(pkg);
         } catch {
@@ -56,7 +56,13 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
+    const { DDSketch } = await import('@zakkster/lite-sketch');
     const { createHud } = await import('../Hud.js');
+
+    // The injected quantile factory (optional peer). analytics-ON lanes assert
+    // the write path stays 0 B/op with DDSketch.add wired into write().
+    const mkSketch = () => new DDSketch(0.01);
+    const qStats = { stats: { quantiles: mkSketch } };
 
     const BREAK = process.env.LITE_HUD_TORTURE_BREAK === '1';
     const CYCLES = 4096;     // retention churn
@@ -86,7 +92,7 @@ async function main() {
         return {
             streams() {
                 return [
-                    { id: 1, name: 'lvl', hz: 60, ops: [{ code: OP_LEVEL, name: 'lvl', kind: 0, width: 1 }] },
+                    { id: 1, name: 'lvl', hz: 60, ops: [{ code: OP_LEVEL, name: 'lvl', kind: 0, width: 1, quantiles: true }] },
                     { id: 2, name: 'inst', ops: [{ code: OP_INSTANT, name: 'inst', kind: 1, width: 1 }] },
                     { id: 3, name: 'ctr', ops: [{ code: OP_COUNTER, name: 'ctr', kind: 3, width: 1 }] },
                     { id: 4, name: 'wide', ops: [{ code: OP_WIDE, name: 'wide', kind: 0, width: 3 }] },
@@ -144,6 +150,17 @@ async function main() {
             const ch = hud.channel({ name: 'm', kind: 0 });
             ch.push(i & 15);
             tracker.track(hud, noop, 'hud', { audit: true });
+
+            // analytics-ON: a second HUD with injected sketches (SPAN always +
+            // LEVEL opt-in). Its A/B window sketches + scratch are owned by the
+            // channels, owned by the HUD -> released with it (size() -> 0).
+            const hq = createHud(null, qStats);
+            hq.attach(makeScope());
+            hq.write(packed(1, OP_LEVEL), i, i & 63, 0);   // opted-in LEVEL sketch
+            hq.write(packed(5, OP_SPAN), i, 4, 0);          // complete SPAN sketch
+            hq.write(packed(6, OP_OPEN), i, i & 7, 0);
+            hq.write(packed(6, OP_CLOSE), i + 1, i & 7, 0); // paired SPAN sketch
+            tracker.track(hq, noop, 'hudq', { audit: true });
         }
         return tracker.size();
     }
@@ -243,6 +260,42 @@ async function main() {
         chCtr.push(uv & 255);
     });
 
+    // ---- phase 2a: analytics-ON write path, FRACTIONAL inputs (0 RETAINED) -----
+    // Fractional values are the realistic case; the zero-box addFrom(buf, i) path
+    // stores the value into the channel's Float64Array in write()'s frame and the
+    // peer reads it UNBOXED, so no HeapNumber is RETAINED. (The scavenge-scaling
+    // delta on fractional inputs is gated in test/perf/AnalyticsBox.test.mjs.)
+    let qfrac = 0;
+    const nextFrac = () => { qfrac = (qfrac + 1) | 0; return 1 + (qfrac % 9973) * 0.001; };
+
+    const hudQL = createHud(null, qStats); hudQL.attach(makeScope());
+    let qlt = 0;
+    gate('analytics LEVEL write (fractional)', () => { qlt = (qlt + 1) | 0; hudQL.write(packed(1, OP_LEVEL), qlt + 0.5, nextFrac(), 0); });
+
+    const hudQS = createHud(null, qStats); hudQS.attach(makeScope());
+    let qst = 0;
+    gate('analytics complete SPAN write (fractional)', () => { qst = (qst + 1) | 0; hudQS.write(packed(5, OP_SPAN), qst + 0.5, nextFrac(), 0); });
+
+    const hudQP = createHud(null, qStats); hudQP.attach(makeScope());
+    let qpt = 0;
+    gate('analytics paired open+close (fractional)', () => {
+        qpt = (qpt + 1) | 0;
+        const k = qpt & 63;
+        const t = qpt + 0.5;
+        hudQP.write(packed(6, OP_OPEN), t, k, 0);
+        hudQP.write(packed(6, OP_CLOSE), t + nextFrac(), k, 0); // fractional duration
+    });
+
+    // channel().push() into a sketched SPAN/LEVEL (RETAINED lane; push reads
+    // wall-clock time, a transient box on the scavenge lane -- gated here).
+    const hudQPush = createHud(null, qStats);
+    const chQSpan = hudQPush.channel({ name: 'qs', kind: 2 });               // SPAN inherits default
+    const chQLvl = hudQPush.channel({ name: 'ql', kind: 0, quantiles: mkSketch }); // LEVEL opt-in
+    gate('analytics channel().push() (fractional)', () => {
+        chQSpan.push(nextFrac());
+        chQLvl.push(nextFrac());
+    });
+
     // CONTROL: an allocating step that MUST trip the gate when armed.
     if (BREAK) {
         const sink = [];
@@ -251,6 +304,32 @@ async function main() {
             bv = (bv + 1) | 0;
             sink.push({ v: bv }); // fresh object retained per op -> real allocation
             if (sink.length > 4096) sink.length = 0;
+        });
+
+        // CONTROL (analytics break): an injected factory whose addFrom() closes
+        // over a per-op sink (the HUD's hot path calls addFrom, not add) -> the
+        // analytics write path allocates. It carries the N1 getters so
+        // enableSketch accepts it. It MUST trip the gate.
+        const asink = [];
+        const badFactory = () => {
+            const d = new DDSketch(0.01);
+            return {
+                addFrom(buf, i) { asink.push({ v: buf[i] }); if (asink.length > 4096) asink.length = 0; return d.addFrom(buf, i); },
+                quantile(q) { return d.quantile(q); },
+                merge(o) { return d; },
+                clear() { return d.clear(); },
+                get strict() { return d.strict; },
+                get minIndexable() { return d.minIndexable; },
+                get maxIndexable() { return d.maxIndexable; },
+                get count() { return d.count; },
+            };
+        };
+        const hudBad = createHud(null, { stats: { quantiles: badFactory } });
+        hudBad.attach(makeScope());
+        let abv = 0;
+        gate('CONTROL analytics per-add closure', () => {
+            abv = (abv + 1) | 0;
+            hudBad.write(packed(5, OP_SPAN), abv, (abv & 63) + 1, 0); // addFrom() allocates
         });
     }
 
@@ -286,6 +365,33 @@ async function main() {
     const pairedMinor = sSc.gc.minor;
     const pairedScavengeOk = pairedMinor === 0;
 
+    // ---- phase 2c: analytics-ON SCAVENGE lane (DDSketch.add wired in) --------
+    // Drive LEVEL (opted-in) + complete SPAN + paired open/close through the
+    // analytics write path with SMI-domain inputs and assert minor == 0: the
+    // pre-check + O(1) rotate + DDSketch.add must not churn the young generation.
+    // clear() at each windowSec/2 rotation is 0-alloc (record time = the SMI i).
+    const hudQsc = createHud(null, qStats); hudQsc.attach(makeScope());
+    for (let i = 0; i < 50000; i++) {
+        hudQsc.write(packed(1, OP_LEVEL), i, i & 63, 0);
+        hudQsc.write(packed(5, OP_SPAN), i, (i & 63) + 1, 0);
+        hudQsc.write(packed(6, OP_OPEN), i & 63, i & 63, 0);
+        hudQsc.write(packed(6, OP_CLOSE), (i & 63) + 3, i & 63, 0);
+    }
+    const gcQ = new GcProfiler().start();
+    for (let i = 0; i < HOT; i++) {
+        const k = i & 63;
+        hudQsc.write(packed(1, OP_LEVEL), i, k, 0);            // LEVEL sketch add
+        hudQsc.write(packed(5, OP_SPAN), i, k + 1, 0);          // complete SPAN add
+        hudQsc.write(packed(6, OP_OPEN), i, k, 0);
+        hudQsc.write(packed(6, OP_CLOSE), i + 3, k, 0);         // paired SPAN add
+        if ((i & 8191) === 0) gcQ.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    const sQ = gcQ.summary();
+    gcQ.stop();
+    const analyticsMinor = sQ.gc.minor;
+    const analyticsScavengeOk = analyticsMinor === 0;
+
     // ---- phase 3: GC budget over a combined steady-state hot loop ----------
     const gc = new GcProfiler().start();
     const hud = createHud(null); hud.attach(makeScope());
@@ -318,6 +424,9 @@ async function main() {
     // backing buffers. arrayBuffers delta across the cycles must be <= 0.
     const hAb = createHud(null); hAb.attach(makeScope());
     for (let k = 0; k < 300; k++) hAb.write(packed(7, OP_OPEN), k, k, 0); // prime pool
+    // analytics-ON hud too: its A/B window sketches + scratch are fixed typed
+    // arrays allocated at attach; repeated fill cycles reuse them byte-for-byte.
+    const hAbQ = createHud(null, qStats); hAbQ.attach(makeScope());
     globalThis.gc();
     const abBefore = process.memoryUsage().arrayBuffers;
     let abk = 1000;
@@ -328,6 +437,8 @@ async function main() {
             hAb.write(packed(6, OP_CLOSE), i + 1, i & 63, 0);
             abk = (abk + 1) | 0;
             hAb.write(packed(7, OP_OPEN), abk, abk, 0);        // eviction churn
+            hAbQ.write(packed(1, OP_LEVEL), i, i & 63, 0);     // analytics LEVEL add
+            hAbQ.write(packed(5, OP_SPAN), i, (i & 63) + 1, 0); // analytics SPAN add
         }
     }
     globalThis.gc();
@@ -348,7 +459,8 @@ async function main() {
     }
     // With the control armed, the run MUST fail overall.
     const gatesOk = report.ok && trackedOk && live === 0 &&
-        findings.length === 0 && allocOk && abOk && pairedScavengeOk;
+        findings.length === 0 && allocOk && abOk && pairedScavengeOk &&
+        analyticsScavengeOk;
     const ok = BREAK ? false : gatesOk;
 
     console.log(
@@ -358,6 +470,7 @@ async function main() {
         ' maxMs=' + s.gc.maxMs.toFixed(2) +
         ' | alloc=' + (allocFindings === 0 ? '0' : allocFindings + ' nonzero') + ' B/op' +
         ' | paired-scavenge=' + pairedMinor +
+        ' | analytics-scavenge=' + analyticsMinor +
         ' | abGrowth=' + abDelta + ' | ' + (ok ? 'ok' : 'FAIL'));
 
     if (!ok) {
@@ -376,6 +489,7 @@ async function main() {
         }
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         if (!pairedScavengeOk) console.error('  paired-span scavenges ' + pairedMinor + ' > 0 (a Map-like open pool churns the young gen)');
+        if (!analyticsScavengeOk) console.error('  analytics scavenges ' + analyticsMinor + ' > 0 (the analytics write path churns the young gen)');
         process.exitCode = 1;
     }
 }

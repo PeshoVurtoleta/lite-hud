@@ -1,4 +1,4 @@
-// @zakkster/lite-hud 2.1.0 -- node:test suite
+// @zakkster/lite-hud 2.2.0 -- node:test suite
 // All tests run without a DOM (mountEl = null).
 // Copyright (c) 2026 Zahary Shinikchiev <shinikchiev@yahoo.com>
 // MIT License
@@ -6,6 +6,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHud, VERSION } from '../Hud.js';
+// Optional peer (devDep): the real DDSketch, injected as a `() => DDSketch`
+// factory. The HUD never imports it -- these tests do, to witness the analytics.
+import { DDSketch } from '@zakkster/lite-sketch';
 
 // ---------------------------------------------------------------------------
 // Mock scope factory
@@ -32,8 +35,8 @@ function packed(sid, op) { return sid * 65536 + op; }
 // 1. Version
 // ---------------------------------------------------------------------------
 
-test('VERSION is 2.1.0', () => {
-  assert.equal(VERSION, '2.1.0');
+test('VERSION is 2.2.0', () => {
+  assert.equal(VERSION, '2.2.0');
 });
 
 // ---------------------------------------------------------------------------
@@ -1338,4 +1341,542 @@ test('createHud: a successful viewport setup DOES attach exactly one keydown lis
   } finally {
     uninstallDom(saved);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 21. DDSketch quantile analytics (M2) -- oracle + degrade
+// ---------------------------------------------------------------------------
+
+// Deterministic PRNG (mulberry32) so the oracle gate is reproducible.
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Generate one positive sample from the named distribution.
+function sample(rnd, dist) {
+  const u = rnd();
+  if (dist === 'uniform') return 1 + u * 999;                 // (1, 1000)
+  if (dist === 'lognormal') return Math.exp(2 + 1.2 * (rnd() + rnd() + rnd() - 1.5));
+  // pareto (heavy tail), xm=1, alpha=1.5
+  return 1 / Math.pow(1 - u, 1 / 1.5);
+}
+
+const ORACLE_ALPHA = 0.01;
+const ORACLE_N = 20000;
+const ORACLE_QS = [0.5, 0.9, 0.99, 0.999];
+
+for (const dist of ['uniform', 'lognormal', 'pareto']) {
+  test('quantile oracle: ' + dist + ' within alpha over a rotation boundary', () => {
+    const mkS = () => new DDSketch(ORACLE_ALPHA);
+    // A complete-SPAN channel: write(packed, t_start, duration, 0) -> the HUD
+    // sketches `duration`, keyed on t_start for the window rotation.
+    const OP = 0x0100;
+    const scope = mockScope([
+      { id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] },
+    ]);
+    const hud = createHud(null, { windowSec: 5, stats: { quantiles: mkS } });
+    hud.attach(scope);
+    const p = packed(1, OP);
+
+    // Timeline spans [10000, 14000] ms -> crosses the single 12500 half-boundary
+    // (windowSec/2 = 2500) exactly once; total span 4000 < window 5000, so every
+    // record is retained across the A/B merge (no eviction).
+    const rnd = mulberry32(0xC0FFEE ^ dist.length);
+    const vals = new Float64Array(ORACLE_N);
+    for (let i = 0; i < ORACLE_N; i++) {
+      const v = sample(rnd, dist);
+      vals[i] = v;
+      const t = 10000 + (i * 4000) / ORACLE_N;
+      hud.write(p, t, v, 0);
+    }
+
+    // Oracle: the exact value at the same 0-indexed rank DDSketch walks to.
+    const sorted = Float64Array.from(vals).sort();
+    const r = hud.inspect('lat');
+    assert.ok(r && r.quantiles, 'inspect exposes a quantile readout');
+    assert.equal(r.quantiles.n, ORACLE_N, 'the whole stream survived the window');
+
+    const got = { 0.5: r.quantiles.p50, 0.9: r.quantiles.p90, 0.99: r.quantiles.p99, 0.999: r.quantiles.p999 };
+    for (const q of ORACLE_QS) {
+      const oracle = sorted[Math.floor(q * (ORACLE_N - 1))];
+      const relErr = Math.abs(got[q] - oracle) / oracle;
+      assert.ok(relErr <= ORACLE_ALPHA + 1e-9,
+        dist + ' q=' + q + ' relErr ' + relErr.toFixed(5) + ' exceeds alpha ' + ORACLE_ALPHA +
+        ' (hud=' + got[q] + ' oracle=' + oracle + ')');
+    }
+  });
+}
+
+test('quantile oracle: an empty window reads "--" (n:0, NaN quantiles), never 0', () => {
+  const mkS = () => new DDSketch(ORACLE_ALPHA);
+  const hud = createHud(null, { windowSec: 5, stats: { quantiles: mkS } });
+  // A LEVEL channel opted in via the per-channel override. Feed only NEGATIVE
+  // values: the ring records them (count > 0) but the pre-check drops every one,
+  // so the sketch window is empty.
+  const lvl = hud.channel({ name: 'neg', kind: 0, quantiles: mkS });
+  for (let i = 0; i < 100; i++) lvl.push(-1 - i);
+  const r = hud.inspect('neg');
+  assert.ok(r && r.quantiles, 'a sketched channel exposes a quantile readout');
+  assert.equal(r.quantiles.n, 0, 'the window is empty (all values dropped)');
+  assert.ok(Number.isNaN(r.quantiles.p50), 'empty p50 is NaN (renders "--", not 0)');
+  assert.ok(Number.isNaN(r.quantiles.p99), 'empty p99 is NaN');
+  assert.equal(hud.stats().quantileDrops, 100, 'every dropped value is counted');
+});
+
+// -- Degrade: with NO factory, stats + render trace are 2.1.0-identical --------
+
+// A recording 2d context: captures every draw call (with fillText args) so the
+// render trace can be compared. Only the calls the HUD actually makes are stubbed.
+function recordingCtx() {
+  const calls = [];
+  const rec = (name) => (...a) => { calls.push(name + '(' + a.join(',') + ')'); };
+  return {
+    _calls: calls,
+    setTransform: rec('setTransform'), scale: rec('scale'),
+    fillRect: rec('fillRect'), strokeRect: rec('strokeRect'),
+    beginPath: rec('beginPath'), moveTo: rec('moveTo'), lineTo: rec('lineTo'),
+    stroke: rec('stroke'), fillText: rec('fillText'), save: rec('save'),
+    restore: rec('restore'), rect: rec('rect'), clip: rec('clip'),
+    setLineDash: rec('setLineDash'),
+    fillStyle: '', strokeStyle: '', lineWidth: 0, font: '', textAlign: '',
+  };
+}
+
+function installRecordingDom() {
+  const saved = {
+    document: globalThis.document, devicePixelRatio: globalThis.devicePixelRatio,
+    hasDoc: 'document' in globalThis, hasDpr: 'devicePixelRatio' in globalThis,
+  };
+  let lastCtx = null;
+  const mkNode = (tag) => {
+    const ctx = tag === 'canvas' ? recordingCtx() : null;
+    if (ctx) lastCtx = ctx;
+    return {
+      tagName: tag.toUpperCase(), id: '', style: {}, width: 0, height: 0,
+      children: [], parentElement: null,
+      getContext() { return ctx; },
+      addEventListener() {}, removeEventListener() {},
+      remove() { const p = this.parentElement; if (p) { const i = p.children.indexOf(this); if (i >= 0) p.children.splice(i, 1); } this.parentElement = null; },
+      appendChild(c) { c.parentElement = this; this.children.push(c); return c; },
+      getBoundingClientRect() { return { width: parseFloat(this.style.width) || 0, height: parseFloat(this.style.height) || 0 }; },
+    };
+  };
+  globalThis.document = {
+    createElement: mkNode, getElementById: () => null,
+    addEventListener() {}, removeEventListener() {}, body: mkNode('div'), _listeners: [],
+  };
+  globalThis.devicePixelRatio = 1;
+  return { saved, mount: mkNode('div'), lastCtx: () => lastCtx };
+}
+
+function restoreDom(h) {
+  if (h.saved.hasDoc) globalThis.document = h.saved.document; else delete globalThis.document;
+  if (h.saved.hasDpr) globalThis.devicePixelRatio = h.saved.devicePixelRatio; else delete globalThis.devicePixelRatio;
+}
+
+function feedSpan(hud, p, base) {
+  for (let i = 0; i < 40; i++) hud.write(p, base + i * 50, 5 + (i % 7), 0);
+}
+
+test('degrade: no-factory stats() is 2.1.0-shaped with quantileDrops === 0', () => {
+  const OP = 0x0100;
+  const scope = mockScope([
+    { id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] },
+  ]);
+  const hud = createHud(null, { windowSec: 5 }); // NO stats factory
+  hud.attach(scope);
+  feedSpan(hud, packed(1, OP), 1000);
+  const s = hud.stats();
+  assert.deepEqual(s, {
+    drops: 0, channels: 1, epoch: null, verdicts: 0, budgets: 0,
+    quantileDrops: 0,
+    channelStats: [{ name: 'lat', count: 40, head: s.channelStats[0].head }],
+  });
+  // inspect() has NO quantiles key when analytics is off (byte-identical shape).
+  const r = hud.inspect('lat');
+  assert.ok(r && !('quantiles' in r), 'no quantiles field with no factory injected');
+});
+
+test('degrade: no-factory render emits zero M2 draw calls (2.1.0 trace)', () => {
+  const OP = 0x0100;
+  const h = installRecordingDom();
+  try {
+    const scope = mockScope([
+      { id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] },
+    ]);
+    const hud = createHud(h.mount, { windowSec: 5 }); // NO factory
+    hud.attach(scope);
+    feedSpan(hud, packed(1, OP), Date.now());
+    hud.render(); // warm-up: settles the lazy height resize (a one-time cost)
+    const mark = h.lastCtx()._calls.length;
+    hud.render();
+    const t1 = h.lastCtx()._calls.slice(mark);
+    const mark2 = h.lastCtx()._calls.length;
+    hud.render();
+    const t2 = h.lastCtx()._calls.slice(mark2);
+    // Determinism: a second render repeats the same trace (no drift).
+    assert.deepEqual(t2, t1, 'render is deterministic frame-to-frame');
+    // No percentile tiles, no p50-p99 band text.
+    for (const c of t1) {
+      assert.ok(c.indexOf('p50 ') === -1 && c.indexOf('p99') === -1,
+        'no M2 percentile text with no factory: ' + c);
+    }
+  } finally {
+    restoreDom(h);
+  }
+});
+
+test('non-vacuous: WITH a factory, render DOES emit percentile tiles', () => {
+  const OP = 0x0100;
+  const h = installRecordingDom();
+  try {
+    const mkS = () => new DDSketch(ORACLE_ALPHA);
+    const scope = mockScope([
+      { id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] },
+    ]);
+    const hud = createHud(h.mount, { windowSec: 5, stats: { quantiles: mkS } });
+    hud.attach(scope);
+    feedSpan(hud, packed(1, OP), Date.now());
+    hud.render();
+    const trace = h.lastCtx()._calls;
+    assert.ok(trace.some((c) => c.indexOf('p50 ') !== -1 && c.indexOf('p99') !== -1),
+      'the tile line is drawn when analytics is on (the degrade gate is non-vacuous)');
+  } finally {
+    restoreDom(h);
+  }
+});
+
+// -- Fail-closed validation ----------------------------------------------------
+
+test('createHud: a strict-range DDSketch factory fails closed at attach', () => {
+  const OP = 0x0100;
+  const strictFactory = () => new DDSketch(ORACLE_ALPHA, { range: [1, 1000] });
+  const scope = mockScope([
+    { id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] },
+  ]);
+  const hud = createHud(null, { stats: { quantiles: strictFactory } });
+  assert.throws(() => hud.attach(scope), /@zakkster\/lite-hud:.*strict-range/);
+});
+
+test('createHud: a non-function stats.quantiles throws typeof-first', () => {
+  assert.throws(() => createHud(null, { stats: { quantiles: 42 } }),
+    /@zakkster\/lite-hud:.*stats\.quantiles must be/);
+  assert.throws(() => createHud(null, { stats: 7 }),
+    /@zakkster\/lite-hud:.*stats must be an object/);
+});
+
+test('channel(): quantiles on a COUNTER channel is a misuse (fail closed)', () => {
+  const mkS = () => new DDSketch(ORACLE_ALPHA);
+  const hud = createHud(null);
+  assert.throws(() => hud.channel({ name: 'c', kind: 3, quantiles: mkS }),
+    /@zakkster\/lite-hud:.*SPAN or LEVEL/);
+  assert.throws(() => hud.channel({ name: 'b', kind: 0, quantiles: 'x' }),
+    /@zakkster\/lite-hud:.*channel quantiles must be/);
+});
+
+test('channel(): quantiles:false opts a channel out even with a default factory', () => {
+  const mkS = () => new DDSketch(ORACLE_ALPHA);
+  const hud = createHud(null, { stats: { quantiles: mkS } });
+  const sp = hud.channel({ name: 'sp', kind: 2, quantiles: false });
+  sp.push(10);
+  const r = hud.inspect('sp');
+  assert.ok(r && !('quantiles' in r), 'opted-out SPAN channel has no readout');
+});
+
+test('drop accounting: a NaN / negative value is a quantileDrop, not a demux drop', () => {
+  const mkS = () => new DDSketch(ORACLE_ALPHA);
+  const OP = 0x0100;
+  const scope = mockScope([
+    { id: 1, name: 'sp', ops: [{ code: OP, name: 'sp', kind: 2, width: 1, paired: false }] },
+  ]);
+  const hud = createHud(null, { stats: { quantiles: mkS } });
+  hud.attach(scope);
+  const p = packed(1, OP);
+  // write() carries the raw duration in `a`, so NaN / negatives reach the
+  // pre-check verbatim (channel().push coerces NaN->0 via `value || 0`).
+  hud.write(p, 1000, 10, 0);    // valid
+  hud.write(p, 1050, -5, 0);    // negative -> quantile drop
+  hud.write(p, 1100, NaN, 0);   // NaN -> quantile drop
+  const s = hud.stats();
+  assert.equal(s.drops, 0, 'demux drops unchanged');
+  assert.equal(s.quantileDrops, 2, 'two values rejected by the pre-check');
+  assert.equal(hud.inspect('sp').quantiles.n, 1, 'only the valid value reached the sketch');
+});
+
+test('pre-check boundaries match the peer exactly (exclusive low, inclusive high)', () => {
+  // The HUD pre-check must accept/reject exactly what DDSketch.addFrom does:
+  // a finite v with minIndexable < v <= maxIndexable, plus exact 0.
+  const probe = new DDSketch(0.01);
+  const lo = probe.minIndexable, hi = probe.maxIndexable;
+  const raw = new DDSketch(0.01);
+  const b = new Float64Array(1);
+  const peerAccepts = (v) => { b[0] = v; try { raw.addFrom(b, 0); return true; } catch { return false; } };
+
+  const edges = [lo, lo * 0.5, lo * 2, hi, 0, -0, Number.MIN_VALUE, 1.5, -1, NaN, Infinity, -Infinity];
+  const mkS = () => new DDSketch(0.01);
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'e', ops: [{ code: OP, name: 'e', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { stats: { quantiles: mkS } });
+  hud.attach(scope);
+  const p = packed(1, OP);
+
+  let expectAccept = 0, expectDrop = 0, t = 1000;
+  for (const v of edges) {
+    if (peerAccepts(v)) expectAccept++; else expectDrop++;
+    hud.write(p, t++, v, 0);
+  }
+  const r = hud.inspect('e');
+  assert.equal(r.quantiles.n, expectAccept, 'HUD sketched exactly the peer-accepted values');
+  assert.equal(hud.stats().quantileDrops, expectDrop, 'HUD dropped exactly the peer-rejected values');
+  // Spot-check the two exact edges directly.
+  assert.equal(peerAccepts(lo), false, 'peer: v === minIndexable is REJECTED (exclusive floor)');
+  assert.equal(peerAccepts(hi), true, 'peer: v === maxIndexable is ACCEPTED (inclusive ceiling)');
+});
+
+test('createHud: a factory whose sketch lacks a strict getter fails closed', () => {
+  // strict === undefined is an unverified state -> reject (require strict === false).
+  const badFactory = () => {
+    const d = new DDSketch(0.01);
+    return {
+      addFrom: (buf, i) => d.addFrom(buf, i),
+      quantile: (q) => d.quantile(q),
+      merge: (o) => d,
+      clear: () => d.clear(),
+      // no `strict` getter
+      get minIndexable() { return d.minIndexable; },
+      get maxIndexable() { return d.maxIndexable; },
+      get count() { return d.count; },
+    };
+  };
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { stats: { quantiles: badFactory } });
+  assert.throws(() => hud.attach(scope), /@zakkster\/lite-hud:.*strict === false/);
+});
+
+test('createHud: a factory whose sketch lacks addFrom fails closed', () => {
+  const noAddFrom = () => {
+    const d = new DDSketch(0.01);
+    return { quantile: (q) => d.quantile(q), merge: (o) => d, clear: () => d.clear(),
+      get strict() { return false; }, get minIndexable() { return d.minIndexable; },
+      get maxIndexable() { return d.maxIndexable; }, get count() { return d.count; } };
+  };
+  const hud = createHud(null, { stats: { quantiles: noAddFrom } });
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+  assert.throws(() => hud.attach(scope), /@zakkster\/lite-hud:.*addFrom\/quantile\/merge\/clear/);
+});
+
+// ---------------------------------------------------------------------------
+// 22. QA sweep: boundary matrix gaps (M2 rework) -- min/max edges, invalid
+// bounds, COUNTER/INSTANT exclusion, rotation adversarials, reentrancy.
+// ---------------------------------------------------------------------------
+
+function fakeSketch(minI, maxI) {
+  const d = new DDSketch(0.01);
+  return {
+    addFrom: (b, i) => d.addFrom(b, i), quantile: (q) => d.quantile(q),
+    merge: () => d, clear: () => d.clear(),
+    strict: false, minIndexable: minI, maxIndexable: maxI, count: 0,
+  };
+}
+
+test('pre-check: a value just above maxIndexable (a true bucket step, not an FP dust delta) is rejected', () => {
+  const probe = new DDSketch(0.01);
+  const hi = probe.maxIndexable;
+  const justAbove = hi * 1.0000001; // crosses a real gamma-bucket step; peer-verified to reject
+  const b = new Float64Array(1);
+  assert.notEqual(justAbove, hi, 'the probe value must actually differ from hi');
+  assert.throws(() => { b[0] = justAbove; probe.addFrom(b, 0); }, 'peer rejects just-above-hi');
+
+  const mkS = () => new DDSketch(0.01);
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'e', ops: [{ code: OP, name: 'e', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { stats: { quantiles: mkS } });
+  hud.attach(scope);
+  hud.write(packed(1, OP), 1000, justAbove, 0);
+  hud.write(packed(1, OP), 1001, hi, 0); // exact ceiling: accepted
+  const r = hud.inspect('e');
+  assert.equal(r.quantiles.n, 1, 'only the exact-ceiling value was sketched');
+  assert.equal(hud.stats().quantileDrops, 1, 'the just-above value was a quantile drop, not sketched');
+});
+
+test('pre-check: a value just above minIndexable is accepted; the exact floor is rejected', () => {
+  const probe = new DDSketch(0.01);
+  const lo = probe.minIndexable;
+  const justAbove = lo * 1.0000001;
+  const mkS = () => new DDSketch(0.01);
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'e2', ops: [{ code: OP, name: 'e2', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { stats: { quantiles: mkS } });
+  hud.attach(scope);
+  hud.write(packed(1, OP), 1000, lo, 0);         // exact floor: rejected (exclusive)
+  hud.write(packed(1, OP), 1001, justAbove, 0);  // just above: accepted
+  const r = hud.inspect('e2');
+  assert.equal(r.quantiles.n, 1, 'only the just-above-floor value was sketched');
+  assert.equal(hud.stats().quantileDrops, 1, 'the exact floor value was a quantile drop');
+});
+
+test('pre-check: exact 0 and -0 both land in the sketch (never dropped)', () => {
+  const mkS = () => new DDSketch(0.01);
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'z', ops: [{ code: OP, name: 'z', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { stats: { quantiles: mkS } });
+  hud.attach(scope);
+  hud.write(packed(1, OP), 1000, 0, 0);
+  hud.write(packed(1, OP), 1001, -0, 0);
+  const r = hud.inspect('z');
+  assert.equal(r.quantiles.n, 2, '0 and -0 both reached the sketch');
+  assert.equal(hud.stats().quantileDrops, 0, 'neither zero was dropped');
+});
+
+test('createHud: a sketch with inverted or non-finite indexable bounds fails closed', () => {
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+  for (const [minI, maxI] of [[100, 1], [NaN, 1000], [1e-300, Infinity], [5, 5]]) {
+    const hud = createHud(null, { stats: { quantiles: () => fakeSketch(minI, maxI) } });
+    assert.throws(() => hud.attach(scope), /@zakkster\/lite-hud:.*invalid indexable bounds/,
+      'bounds [' + minI + ', ' + maxI + '] must fail closed');
+  }
+});
+
+test('COUNTER and INSTANT channels are never sketched, even with a default factory injected', () => {
+  const mkS = () => new DDSketch(0.01);
+  const OPI = 0x0200, OPC = 0x0300;
+  const scope = mockScope([
+    { id: 2, name: 'inst', ops: [{ code: OPI, name: 'inst', kind: 1, width: 1 }] },
+    { id: 3, name: 'ctr', ops: [{ code: OPC, name: 'ctr', kind: 3, width: 1 }] },
+  ]);
+  const hud = createHud(null, { stats: { quantiles: mkS } });
+  hud.attach(scope);
+  hud.write(packed(2, OPI), 1000, 0, 0);
+  hud.write(packed(3, OPC), 1000, 5, 0);
+  assert.ok(!('quantiles' in hud.inspect('inst')), 'INSTANT never sketched');
+  assert.ok(!('quantiles' in hud.inspect('ctr')), 'COUNTER never sketched');
+});
+
+test('rotation: a non-monotonic (backward-jumping) record time does not crash and every accepted value is retained', () => {
+  const mkS = () => new DDSketch(0.01);
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { windowSec: 5, stats: { quantiles: mkS } });
+  hud.attach(scope);
+  hud.write(packed(1, OP), 1000, 10, 0);
+  hud.write(packed(1, OP), 500, 20, 0);   // t goes BACKWARD
+  hud.write(packed(1, OP), 1500, 30, 0);
+  const r = hud.inspect('lat');
+  assert.equal(r.quantiles.n, 3, 'no crash; a backward t simply does not trigger rotation');
+});
+
+test('rotation: a t jump wider than windowSec clears BOTH window halves (no stale mass survives)', () => {
+  const mkS = () => new DDSketch(0.01);
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { windowSec: 5, stats: { quantiles: mkS } });
+  hud.attach(scope);
+  for (let i = 0; i < 50; i++) hud.write(packed(1, OP), 1000 + i * 10, 100 + i, 0);
+  assert.equal(hud.inspect('lat').quantiles.n, 50, 'pre-jump baseline');
+  hud.write(packed(1, OP), 1000 + 50 * 10 + 20000, 999, 0); // jump 20000ms >> windowSec*1000 (5000ms)
+  const r = hud.inspect('lat');
+  assert.equal(r.quantiles.n, 1, 'the jump clears both A and B; only the post-jump value survives');
+});
+
+test('rotation: a NaN record time skips rotation but a valid value still reaches the sketch', () => {
+  const mkS = () => new DDSketch(0.01);
+  const OP = 0x0100;
+  const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+  const hud = createHud(null, { windowSec: 5, stats: { quantiles: mkS } });
+  hud.attach(scope);
+  hud.write(packed(1, OP), NaN, 42, 0);
+  const r = hud.inspect('lat');
+  assert.equal(r.quantiles.n, 1, 'the value is valid; only the rotation check is skipped for NaN t');
+  assert.equal(hud.stats().quantileDrops, 0, 'a NaN t is not itself a quantile drop (the value was fine)');
+});
+
+test('reentrancy: a render() invoked from inside a draw call does not corrupt the quantile readout', () => {
+  const OP = 0x0100;
+  const h = installRecordingDom();
+  let hudRef;
+  try {
+    const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+    const mkS = () => new DDSketch(ORACLE_ALPHA);
+    const hud = createHud(h.mount, { windowSec: 5, stats: { quantiles: mkS } });
+    hudRef = hud;
+    hud.attach(scope);
+    feedSpan(hud, packed(1, OP), 1000);
+    hud.render(); // warm-up (settles lazy height resize)
+    // Patch fillText to re-enter render() exactly once, mid-frame.
+    const ctx = h.lastCtx();
+    let reentered = false;
+    const origFillText = ctx.fillText;
+    let seen = 0;
+    ctx.fillText = (...a) => {
+      seen++;
+      origFillText(...a);
+      if (!reentered && seen === 2) { reentered = true; hudRef.render(); }
+    };
+    assert.doesNotThrow(() => hud.render(), 're-entrant render must not throw');
+    assert.ok(reentered, 'the reentrancy actually fired');
+    const r = hud.inspect('lat');
+    assert.equal(r.quantiles.n, 40, 'the sketch count is unaffected by the reentrant render (render never writes)');
+  } finally {
+    restoreDom(h);
+  }
+});
+
+test('adversarial: destroy() called reentrantly from inside a draw call during render survives (per-frame ctx snapshot)', () => {
+  // render() takes a per-frame LOCAL snapshot of the context and draws only through
+  // it, so a reentrant destroy() invoked mid-frame (here from a patched
+  // ctx.fillText) nulls the closure `_ctx` but not the running frame's local. The
+  // frame finishes harmlessly on the detached context; the HUD is fully torn down
+  // afterwards; and a later render() is a no-op (the guard sees _ctx === null).
+  const OP = 0x0100;
+  const h = installRecordingDom();
+  try {
+    const scope = mockScope([{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]);
+    const mkS = () => new DDSketch(ORACLE_ALPHA);
+    const hud = createHud(h.mount, { windowSec: 5, stats: { quantiles: mkS } });
+    hud.attach(scope);
+    feedSpan(hud, packed(1, OP), 1000);
+    hud.render(); // warm-up
+    const ctx = h.lastCtx();
+    let seen = 0;
+    const origFillText = ctx.fillText;
+    ctx.fillText = (...a) => {
+      seen++;
+      origFillText(...a);
+      if (seen === 2) hud.destroy(); // reentrant destroy mid-frame
+    };
+    assert.doesNotThrow(() => hud.render(),
+      'a reentrant destroy() mid-frame must not throw -- the frame draws through the local ctx snapshot');
+    // The HUD is fully destroyed: the canvas is detached and the keydown listener gone.
+    assert.equal(h.mount.children.length, 0, 'destroy() removed the canvas/wrapper from the mount');
+    assert.equal(globalThis.document._listeners.indexOf('keydown'), -1, 'destroy() removed the keydown listener');
+    assert.equal(hud.visible, true, 'visibility flag is untouched by destroy()');
+    // A later render() is a harmless no-op (the guard bails on the nulled context).
+    assert.doesNotThrow(() => hud.render(), 'render() after destroy() is a no-op');
+  } finally {
+    restoreDom(h);
+  }
+});
+
+test('createHud: a stats.quantiles factory that throws when CALLED propagates the raw peer error and never registers as a scope sink', () => {
+  const OP = 0x0100;
+  let sinkAdded = false;
+  const scope = {
+    streams() { return [{ id: 1, name: 'lat', ops: [{ code: OP, name: 'lat', kind: 2, width: 1, paired: false }] }]; },
+    label() { return null; },
+    addSink() { sinkAdded = true; }, removeSink() {},
+  };
+  const throwingFactory = () => { throw new Error('peer boom'); };
+  const hud = createHud(null, { stats: { quantiles: throwingFactory } });
+  assert.throws(() => hud.attach(scope), /peer boom/,
+    'the factory-thrown error propagates as-is (not a HUD misuse -- the peer itself failed)');
+  assert.equal(sinkAdded, false, 'attach() never reaches addSink() when a channel factory throws mid-loop');
 });
